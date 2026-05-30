@@ -120,7 +120,7 @@ enum KEY_ACTION{
         TAB = 9,            /* Tab */
         CTRL_L = 12,        /* Ctrl+l */
         ENTER = 13,         /* Enter */
-        CTRL_Q = 17,        /* Ctrl-q */
+        CTRL_X = 24,        /* Ctrl-x */
         CTRL_S = 19,        /* Ctrl-s */
         CTRL_U = 21,        /* Ctrl-u */
         ESC = 27,           /* Escape */
@@ -1199,7 +1199,7 @@ void editorProcessKeypress(int fd) {
         /* We ignore ctrl-c, it can't be so simple to lose the changes
          * to the edited file. */
         break;
-    case CTRL_Q:        /* Ctrl-q */
+    case CTRL_X:        /* Ctrl-x */
         /* Quit if the file was already saved. */
         if (E.dirty && quit_times) {
             editorSetStatusMessage("WARNING!!! File has unsaved changes. "
