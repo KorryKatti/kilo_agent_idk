@@ -1186,7 +1186,7 @@ void editorMoveCursor(int key) {
  * is typing stuff on the terminal. */
 #define KILO_QUIT_TIMES 3
 void editorProcessKeypress(int fd) {
-    /* When the file is modified, requires Ctrl-q to be pressed N times
+    /* When the file is modified, requires Ctrl-x to be pressed N times
      * before actually quitting. */
     static int quit_times = KILO_QUIT_TIMES;
 
@@ -1203,7 +1203,7 @@ void editorProcessKeypress(int fd) {
         /* Quit if the file was already saved. */
         if (E.dirty && quit_times) {
             editorSetStatusMessage("WARNING!!! File has unsaved changes. "
-                "Press Ctrl-Q %d more times to quit.", quit_times);
+                "Press Ctrl-X %d more times to quit.", quit_times);
             quit_times--;
             return;
         }
@@ -1299,7 +1299,7 @@ int main(int argc, char **argv) {
     editorOpen(argv[1]);
     enableRawMode(STDIN_FILENO);
     editorSetStatusMessage(
-        "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
+        "HELP: Ctrl-S = save | Ctrl-X = quit | Ctrl-F = find");
     while(1) {
         editorRefreshScreen();
         editorProcessKeypress(STDIN_FILENO);
