@@ -1,5 +1,6 @@
-import gleam/io
+import gleam/io 
 
-pub fn main() -> Nil {
-  io.println("Hello from kilo_gleam!")
+pub fn main() {
+  io.print("kilo-gleam initalized")
+  // first chapter only said till here
 }
