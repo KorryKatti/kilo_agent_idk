@@ -1,26 +1,18 @@
-Kilo
-===
+# Kilo Agent / Kilo-Zig
 
-Kilo is a small text editor in less than 1K lines of code (counted with cloc).
+A personal fork of [Kilo](https://github.com/antirez/kilo) focused on rewriting the editor in Zig and exploring Gleam-based agents.
 
-A screencast is available here: https://asciinema.org/a/90r2i9bq8po03nazhqtsifksb
+### Components
 
-Usage: kilo `<filename>`
+1.  **Zig Rewrite:** Porting the core editor logic to **Zig 0.14.0**. This implementation follows the ["Build Your Own Text Editor"](https://viewsourcecode.org/snaptoken/kilo/) guide. The original `kilo.c` and `Makefile` have been removed to favor a clean-slate Zig implementation. I am using 0.14.0 because i have only read its documentation and newer version have some different io methods and i dont wanna read.
 
-Keys:
+2.  **Gleam AI Agents:** A concurrent agent framework built in **Gleam**, inspired by [tau](https://github.com/infatoshi/tau) (originally in Rust). The goal is to integrate these agents with the Zig editor for features like code generation and refactoring.
 
-    CTRL-S: Save
-    CTRL-X: Quit
-    CTRL-F: Find string in file (ESC to exit search, arrows to navigate)
+<!--lightweight cursor lmao-->
 
-Kilo does not depend on any library (not even curses). It uses fairly standard
-VT100 (and similar terminals) escape sequences. The project is in alpha
-stage and was written in just a few hours taking code from my other two
-projects, load81 and linenoise.
+idk how long will this take but the zig rewrite will definetly be done
 
-People are encouraged to use it as a starting point to write other editors
-or command line interfaces that are more advanced than the usual REPL
-style CLI.
-
-Kilo was written by Salvatore Sanfilippo aka antirez and is released
-under the BSD 2 clause license.
+### Project Structure
+- `kilo-zig/`: The Zig implementation.
+- `agent/`: The Gleam agent framework.
+- `kilo_to_zig_editor.md` & `gleam_agent_plan.md`: Documentation and roadmaps.
