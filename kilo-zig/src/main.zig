@@ -1,8 +1,17 @@
 const std = @import("std");
 const posix = std.posix;
 
+
+fn die(msg: []const u8, err:anyerror) noreturn {
+    const stderr = std.io.getStdErr().writer();
+    stderr.print("{s}: {s}\n", .{ msg, @errorName(err) }) catch {};
+    std.process.exit(1);
+}
+
 fn enableRawMode() !posix.termios {
-    const orig_termios = try posix.tcgetattr(posix.STDIN_FILENO);
+    const orig_termios = posix.tcgetattr(posix.STDIN_FILENO) catch |err| {
+        die("tcgetattr", err);
+    };
 
     var raw = orig_termios;
 
@@ -29,7 +38,9 @@ fn enableRawMode() !posix.termios {
     raw.cc[@intFromEnum(posix.V.MIN)] = 0;
     raw.cc[@intFromEnum(posix.V.TIME)] = 1;
 
-    try posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, raw);
+    posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, raw) catch |err| {
+        die("tcsetattr", err);
+    };
 
     return orig_termios;
 }
@@ -39,12 +50,20 @@ pub fn main() !void {
     const stdin = std.io.getStdIn();
 
     const orig_termios = try enableRawMode();
-    defer _ = posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, orig_termios) catch {};
+    defer _ = posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, orig_termios) catch |err| {
+        die("tcsetattr",err);
+    };
 
     while (true) {
         var c: u8 = 0;
         // Read 1 byte from stdin
-        const bytes_read = try stdin.read(std.mem.asBytes(&c));
+        const bytes_read = stdin.read(std.mem.asBytes(&c)) catch |err| {
+            if (err==error.WouldBlock){
+                // wouldblock means the read timed out, so we just continue to the next iteration
+                continue;
+            }
+            die("read",err);
+        };
 
         // If no bytes were read (timeout occurred), skip processing
         if (bytes_read == 0) continue;
