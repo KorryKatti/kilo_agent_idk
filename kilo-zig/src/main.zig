@@ -6,12 +6,47 @@ const posix = std.posix;
 // in C this macro is used to convert a character to its corresponding control character. For example, CTRL_KEY('q') would give the control character for 'q', which is 17 (0x11 in hexadecimal). In Zig, we can achieve the same result with a simple function:
 // FIXED: Added 'comptime' so this can be safely evaluated inside the switch pattern matcher
 
+pub const KILO_VERSION = "0.0.1";
+
+
 
 const EditorConfig = struct {
+    cx:c_int=0,
+    cy:c_int=0,
     screenrows:c_int = 0,
     screencols:c_int = 0,
     orig_termios: posix.termios,
 };
+
+
+///*** append buffer ***/
+// struct abuf {
+//   char *b;
+//   int len;
+// };
+// #define ABUF_INIT {NULL, 0}
+const abuf = struct {
+    b: []u8 = &[_]u8{}, // Starts as an empty, valid slice instead of null
+
+    pub const INIT = abuf{};
+};
+
+fn abAppend(allocator:std.mem.Allocator, ab: *abuf, s:[]const u8) !void {
+    // reallocate dynamically managet the length changes
+    const new_mem = allocator.realloc(ab.b, ab.b.len+s.len) catch return;
+
+    // built in slice copying wihtout size matching
+    @memcpy(new_mem[ab.b.len..],s);
+    // what the above line does is it copies the contents of s into the new memory starting at the position right after the current end of ab.b so taht we can append the new string to the existing buffer without overwriting it.
+    ab.b = new_mem;
+}
+
+fn abFree(allocator:std.mem.Allocator, ab: *abuf) void {
+    allocator.free(ab.b);
+    ab.* = abuf.INIT; // Reset to an empty slice after freeing
+}
+
+
 
 fn ctrlKey(comptime k: u8) u8 {
     return k & 0x1f;
@@ -93,74 +128,203 @@ fn getWindowSize(rows: *c_int, cols: *c_int) !c_int {
 var E: EditorConfig = .{ .orig_termios = undefined };
 
 fn initEditor() !void {
-    //   if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
-    const rows_ptr = &E.screenrows;
-    const cols_ptr = &E.screencols;
-    if (try getWindowSize(rows_ptr, cols_ptr) == -1) {
-        die("getWindowSize", error.GenericError);
+    E.cx = 0;
+    E.cy = 0;
+    
+    // Pass pointers directly, just like C
+    if (try getWindowSize(&E.screenrows, &E.screencols) == -1) {
+        return error.WindowSizeFailed; 
     }
 }
 
-fn editorReadKey() !u8 {
-    var c:u8=0;
-    while (true){
+const editorKey = enum(c_int){
+    ARROW_LEFT=1000,
+    ARROW_RIGHT,
+    ARROW_UP,
+    ARROW_DOWN,
+    DEL_KEY,
+    HOME_KEY,
+    END_KEY,
+    PAGE_UP,
+    PAGE_DOWN
+};
+
+fn editorReadKey() !c_int {
+    var c: u8 = 0;
+    while (true) {
         const nread = std.io.getStdIn().read(std.mem.asBytes(&c)) catch |err| {
-            if (err == error.WouldBlock) {
-                continue;
-            }
+            if (err == error.WouldBlock) continue;
             return err;
         };
-        if (nread==1){
-            return c;
+        if (nread == 1) break; // CHANGED: breaks instead of returning early
+    }
+
+    if (c == '\x1b') {
+        var seq = [_]u8{0} ** 3; // FIXED: correct array init
+
+        // FIXED: posix.read now takes proper slices instead of pointers
+        const r1 = posix.read(posix.STDIN_FILENO, seq[0..1]) catch return '\x1b';
+        if (r1 != 1) return '\x1b';
+
+        const r2 = posix.read(posix.STDIN_FILENO, seq[1..2]) catch return '\x1b';
+        if (r2 != 1) return '\x1b';
+
+        if (seq[0] == '[') {
+            if (seq[1] >= '0' and seq[1] <= '9') {
+                const r3 = posix.read(posix.STDIN_FILENO, seq[2..3]) catch return '\x1b';
+                if (r3 != 1) return '\x1b';
+                
+                if (seq[2] == '~') {
+                    switch (seq[1]) {
+                        '1' => return @intFromEnum(editorKey.HOME_KEY),
+                        '3'=>return @intFromEnum(editorKey.DEL_KEY),
+                        '4'=> return @intFromEnum(editorKey.END_KEY),
+                        '5' => return @intFromEnum(editorKey.PAGE_UP),
+                        '6' => return @intFromEnum(editorKey.PAGE_DOWN),
+                        '7'=> return @intFromEnum(editorKey.HOME_KEY),
+                        '8'=> return @intFromEnum(editorKey.END_KEY),
+                        else => {},
+                    }
+                }
+            } else {
+                switch (seq[1]) {
+                    'A' => return @intFromEnum(editorKey.ARROW_UP),
+                    'B' => return @intFromEnum(editorKey.ARROW_DOWN),
+                    'C' => return @intFromEnum(editorKey.ARROW_RIGHT),
+                    'D' => return @intFromEnum(editorKey.ARROW_LEFT),
+                    'H'=> return @intFromEnum(editorKey.HOME_KEY),
+                    'F'=>return @intFromEnum(editorKey.END_KEY),
+                    else => return '\x1b',
+                }
+            }
+        }else if(seq[0]=='O'){
+            switch (seq[1]){
+                'H'=> return @intFromEnum(editorKey.HOME_KEY),
+                'F'=>return @intFromEnum(editorKey.END_KEY),
+                else => return '\x1b',
+            }
         }
+        return '\x1b';
+    } else {
+        return c;
     }
 }
 
 fn editorProcessKeypress() !void {
     const c = try editorReadKey();
+    
     switch (c) {
-        ctrlKey('x') => {
-            const stdout = std.io.getStdOut().writer();
-            // Clear the screen before exiting
-            try stdout.writeAll("\x1b[2J");
-            try stdout.writeAll("\x1b[H");
-            // Exit the editor
+        ctrlKey('q') => {
+            _ = posix.write(posix.STDOUT_FILENO, "\x1b[2J") catch {};
+            _ = posix.write(posix.STDOUT_FILENO, "\x1b[H") catch {};
             std.process.exit(0);
         },
-        else => {
-            // For now, we just print the key code
-            const stdout = std.io.getStdOut().writer();
-            try stdout.print("Key pressed: {d}\r\n", .{c});
+
+        @intFromEnum(editorKey.HOME_KEY)=>E.cx=0,
+
+        @intFromEnum(editorKey.END_KEY)=>E.cx = E.screencols-1,
+
+        @intFromEnum(editorKey.PAGE_UP),
+        @intFromEnum(editorKey.PAGE_DOWN) => {
+            var times = E.screenrows;
+            while (times > 0) : (times -= 1) {
+                const target_key = if (c == @intFromEnum(editorKey.PAGE_UP)) 
+                    @intFromEnum(editorKey.ARROW_UP) 
+                else 
+                    @intFromEnum(editorKey.ARROW_DOWN);
+                
+                editorMoveCursor(target_key);
+            }
+        },
+
+        @intFromEnum(editorKey.ARROW_UP),
+        @intFromEnum(editorKey.ARROW_DOWN),
+        @intFromEnum(editorKey.ARROW_LEFT),
+        @intFromEnum(editorKey.ARROW_RIGHT) => {
+            editorMoveCursor(c);
+        },
+        
+        else => {},
+    }
+}
+
+
+
+fn editorRefreshScreen(allocator:std.mem.Allocator) !void {
+    var ab = abuf.INIT;
+    // clear screen and reposition cursor
+    try abAppend(allocator,&ab,"\x1b[?25L");
+    try abAppend(allocator,&ab,"\x1b[H");
+    
+    // darw the tildeds
+    try editorDrawRows(allocator,&ab);
+
+    var buf: [32]u8 = undefined;
+    const msg = try std.fmt.bufPrint(&buf,"\x1b[{d};{d}H",.{E.cy+1,E.cx+1});
+    try abAppend(allocator, &ab, msg);
+
+    // move cursor back to top left
+
+    try abAppend(allocator,&ab,"\x1b[?25h");
+
+    // output complete buffer to terminal
+    _ = posix.write(posix.STDOUT_FILENO,ab.b) catch {};
+
+    // clean up memory allocations
+    abFree(allocator,&ab);
+}
+
+fn editorMoveCursor(key: c_int) void {
+    switch (key) {
+        @intFromEnum(editorKey.ARROW_LEFT) => {
+            if (E.cx != 0) E.cx -= 1;
+        },
+        @intFromEnum(editorKey.ARROW_RIGHT) => {
+            if (E.cx != E.screencols - 1) E.cx += 1;
+        },
+        @intFromEnum(editorKey.ARROW_UP) => {
+            if (E.cy != 0) E.cy -= 1;
+        },
+        @intFromEnum(editorKey.ARROW_DOWN) => {
+            if (E.cy != E.screenrows - 1) E.cy += 1;
+        },
+        else => {},
+    }
+}
+
+
+
+fn editorDrawRows(allocator: std.mem.Allocator, ab: *abuf) !void {
+    var y: c_int = 0;
+    while (y < E.screenrows) : (y += 1) {
+        if (y == @divTrunc(E.screenrows, 3)) {
+            var welcome: [80]u8 = undefined;
+            const res = try std.fmt.bufPrint(&welcome, "Kilo editor -- version {s}", .{KILO_VERSION});
+            
+            var welcomelen = @as(c_int, @intCast(res.len));
+            if (welcomelen > E.screencols) welcomelen = E.screencols;
+
+            var padding = @divTrunc(E.screencols - welcomelen, 2);
+            if (padding > 0) {
+                try abAppend(allocator, ab, "~");
+                padding -= 1;
+            }
+            while (padding > 0) : (padding -= 1) {
+                try abAppend(allocator, ab, " ");
+            }
+
+            try abAppend(allocator, ab, res[0..@as(usize, @intCast(welcomelen))]);
+        } else {
+            try abAppend(allocator, ab, "~");
+        }
+
+        try abAppend(allocator, ab, "\x1b[K");
+        if (y < E.screenrows - 1) {
+            try abAppend(allocator, ab, "\r\n");
         }
     }
 }
 
-fn editorRefreshScreen() !void {
-    const stdout = std.io.getStdOut().writer();
-    
-    // Clear the screen (Sends exactly the 4 bytes: \x1b, [, 2, J)
-    try stdout.writeAll("\x1b[2J");
-    
-    // Move the cursor to the top-left corner (Sends 3 bytes: \x1b, [, H)
-    try stdout.writeAll("\x1b[H");
-
-    try editorDrawRows();
-    stdout.writeAll("\x1b[H") catch {};// this moves the cursor back to the top-left corner after drawing the rows, so that the user can start typing from there
-}
-
-// TODO:
-// continue from here : https://viewsourcecode.org/snaptoken/kilo/03.rawInputAndOutput.html#append-buffer
-
-fn editorDrawRows() !void {
-    var i:i32 = 0;
-    while (i < E.screenrows) {
-        const stdout = std.io.getStdOut().writer();
-        try stdout.writeAll("~");
-        try stdout.writeAll("~\r\n");
-        i += 1;
-        // makes tildes on lhs of screen like vim
-    }
-}
 
 fn die(msg: []const u8, err:anyerror) noreturn {
     // clear screen on exit
@@ -222,6 +386,10 @@ fn disableRawMode() void {
 }
 
 pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    // dang gpa here too
     const stdout = std.io.getStdOut().writer();
     const stdin = std.io.getStdIn();
 
@@ -231,7 +399,7 @@ pub fn main() !void {
     defer disableRawMode();
 
     while (true){
-        try editorRefreshScreen();
+        try editorRefreshScreen(allocator);
         try editorProcessKeypress();
     }
 
