@@ -11,6 +11,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // was told
+    // system macros for c and os layer
+    exe.root_module.addCMacro("_DEFAULT_SOURCE", "1");
+    exe.root_module.addCMacro("_BSD_SOURCE", "1");
+    exe.root_module.addCMacro("_GNU_SOURCE", "1");
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

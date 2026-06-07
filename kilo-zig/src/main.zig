@@ -1,5 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
+const readit = @import("readit.zig"); // made this last year , finally came in use
 
 // define
 // #define CTRL_KEY(k) ((k) & 0x1f)
@@ -8,16 +9,20 @@ const posix = std.posix;
 
 pub const KILO_VERSION = "0.0.1";
 
-
-
-const EditorConfig = struct {
-    cx:c_int=0,
-    cy:c_int=0,
-    screenrows:c_int = 0,
-    screencols:c_int = 0,
-    orig_termios: posix.termios,
+const erow = struct {
+    chars: []u8,
 };
 
+const EditorConfig = struct {
+    cx: c_int = 0,
+    cy: c_int = 0,
+    rowoff: c_int = 0,
+    screenrows: c_int = 0,
+    screencols: c_int = 0,
+    numrows: c_int = 0,
+    row: []erow = &[_]erow{}, // an empty slice to start with
+    orig_termios: posix.termios,
+};
 
 ///*** append buffer ***/
 // struct abuf {
@@ -31,22 +36,20 @@ const abuf = struct {
     pub const INIT = abuf{};
 };
 
-fn abAppend(allocator:std.mem.Allocator, ab: *abuf, s:[]const u8) !void {
+fn abAppend(allocator: std.mem.Allocator, ab: *abuf, s: []const u8) !void {
     // reallocate dynamically managet the length changes
-    const new_mem = allocator.realloc(ab.b, ab.b.len+s.len) catch return;
+    const new_mem = allocator.realloc(ab.b, ab.b.len + s.len) catch return;
 
     // built in slice copying wihtout size matching
-    @memcpy(new_mem[ab.b.len..],s);
+    @memcpy(new_mem[ab.b.len..], s);
     // what the above line does is it copies the contents of s into the new memory starting at the position right after the current end of ab.b so taht we can append the new string to the existing buffer without overwriting it.
     ab.b = new_mem;
 }
 
-fn abFree(allocator:std.mem.Allocator, ab: *abuf) void {
+fn abFree(allocator: std.mem.Allocator, ab: *abuf) void {
     allocator.free(ab.b);
     ab.* = abuf.INIT; // Reset to an empty slice after freeing
 }
-
-
 
 fn ctrlKey(comptime k: u8) u8 {
     return k & 0x1f;
@@ -92,7 +95,19 @@ fn getCursorPosition(rows: *c_int, cols: *c_int) !c_int {
     return 0;
 }
 
+fn editorAppendRow(allocator: std.mem.Allocator, s: []const u8) !void {
+    const at = @as(usize, @intCast(E.numrows));
+    const new_row_count = at + 1;
 
+    const new_rows = try allocator.realloc(E.row, new_row_count);
+    E.row = new_rows;
+
+    const chars_copy = try allocator.dupe(u8, s);
+
+    E.row[at] = erow{ .chars = chars_copy };
+
+    E.numrows += 1;
+}
 
 fn getWindowSize(rows: *c_int, cols: *c_int) !c_int {
     var ws: posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
@@ -101,14 +116,13 @@ fn getWindowSize(rows: *c_int, cols: *c_int) !c_int {
 
     // 1. Check if ioctl failed or returned an empty column width
     if (posix.errno(rc) != .SUCCESS or ws.col == 0) {
-        
+
         // 2. Fallback: Push cursor to the bottom-right corner
         const written = posix.write(posix.STDOUT_FILENO, "\x1b[999C\x1b[999B") catch return -1;
         if (written != 12) return -1;
 
         // 3. Ask the terminal where the cursor is and return that instead
         return getCursorPosition(rows, cols);
-
     } else {
         // 4. Success: Use the values directly from the ioctl struct
         cols.* = ws.col;
@@ -117,37 +131,45 @@ fn getWindowSize(rows: *c_int, cols: *c_int) !c_int {
     }
 }
 
+fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
+    var lines = try readit.readLines(allocator, filename);
+
+    defer lines.deinit();
+
+    for (lines.items) |raw_line| {
+        var line = raw_line;
+
+        if (line.len > 0 and line[line.len - 1] == '\r') {
+            line = line[0 .. line.len - 1];
+        }
+
+        try editorAppendRow(allocator, line);
+    }
+}
+
 // to get size of the terminal
-// c tutorial is using struct 
+// c tutorial is using struct
 //struct editorConfig {
 //   struct termios orig_termios;
 // };
 // struct editorConfig E;
-
 
 var E: EditorConfig = .{ .orig_termios = undefined };
 
 fn initEditor() !void {
     E.cx = 0;
     E.cy = 0;
-    
+    E.rowoff = 0;
+    E.numrows = 0;
+    E.row = &[_]erow{};
+
     // Pass pointers directly, just like C
     if (try getWindowSize(&E.screenrows, &E.screencols) == -1) {
-        return error.WindowSizeFailed; 
+        return error.WindowSizeFailed;
     }
 }
 
-const editorKey = enum(c_int){
-    ARROW_LEFT=1000,
-    ARROW_RIGHT,
-    ARROW_UP,
-    ARROW_DOWN,
-    DEL_KEY,
-    HOME_KEY,
-    END_KEY,
-    PAGE_UP,
-    PAGE_DOWN
-};
+const editorKey = enum(c_int) { ARROW_LEFT = 1000, ARROW_RIGHT, ARROW_UP, ARROW_DOWN, DEL_KEY, HOME_KEY, END_KEY, PAGE_UP, PAGE_DOWN };
 
 fn editorReadKey() !c_int {
     var c: u8 = 0;
@@ -173,16 +195,16 @@ fn editorReadKey() !c_int {
             if (seq[1] >= '0' and seq[1] <= '9') {
                 const r3 = posix.read(posix.STDIN_FILENO, seq[2..3]) catch return '\x1b';
                 if (r3 != 1) return '\x1b';
-                
+
                 if (seq[2] == '~') {
                     switch (seq[1]) {
                         '1' => return @intFromEnum(editorKey.HOME_KEY),
-                        '3'=>return @intFromEnum(editorKey.DEL_KEY),
-                        '4'=> return @intFromEnum(editorKey.END_KEY),
+                        '3' => return @intFromEnum(editorKey.DEL_KEY),
+                        '4' => return @intFromEnum(editorKey.END_KEY),
                         '5' => return @intFromEnum(editorKey.PAGE_UP),
                         '6' => return @intFromEnum(editorKey.PAGE_DOWN),
-                        '7'=> return @intFromEnum(editorKey.HOME_KEY),
-                        '8'=> return @intFromEnum(editorKey.END_KEY),
+                        '7' => return @intFromEnum(editorKey.HOME_KEY),
+                        '8' => return @intFromEnum(editorKey.END_KEY),
                         else => {},
                     }
                 }
@@ -192,15 +214,15 @@ fn editorReadKey() !c_int {
                     'B' => return @intFromEnum(editorKey.ARROW_DOWN),
                     'C' => return @intFromEnum(editorKey.ARROW_RIGHT),
                     'D' => return @intFromEnum(editorKey.ARROW_LEFT),
-                    'H'=> return @intFromEnum(editorKey.HOME_KEY),
-                    'F'=>return @intFromEnum(editorKey.END_KEY),
+                    'H' => return @intFromEnum(editorKey.HOME_KEY),
+                    'F' => return @intFromEnum(editorKey.END_KEY),
                     else => return '\x1b',
                 }
             }
-        }else if(seq[0]=='O'){
-            switch (seq[1]){
-                'H'=> return @intFromEnum(editorKey.HOME_KEY),
-                'F'=>return @intFromEnum(editorKey.END_KEY),
+        } else if (seq[0] == 'O') {
+            switch (seq[1]) {
+                'H' => return @intFromEnum(editorKey.HOME_KEY),
+                'F' => return @intFromEnum(editorKey.END_KEY),
                 else => return '\x1b',
             }
         }
@@ -212,7 +234,7 @@ fn editorReadKey() !c_int {
 
 fn editorProcessKeypress() !void {
     const c = try editorReadKey();
-    
+
     switch (c) {
         ctrlKey('q') => {
             _ = posix.write(posix.STDOUT_FILENO, "\x1b[2J") catch {};
@@ -220,59 +242,57 @@ fn editorProcessKeypress() !void {
             std.process.exit(0);
         },
 
-        @intFromEnum(editorKey.HOME_KEY)=>E.cx=0,
+        @intFromEnum(editorKey.HOME_KEY) => E.cx = 0,
 
-        @intFromEnum(editorKey.END_KEY)=>E.cx = E.screencols-1,
+        @intFromEnum(editorKey.END_KEY) => E.cx = E.screencols - 1,
 
-        @intFromEnum(editorKey.PAGE_UP),
-        @intFromEnum(editorKey.PAGE_DOWN) => {
+        @intFromEnum(editorKey.PAGE_UP), @intFromEnum(editorKey.PAGE_DOWN) => {
             var times = E.screenrows;
             while (times > 0) : (times -= 1) {
-                const target_key = if (c == @intFromEnum(editorKey.PAGE_UP)) 
-                    @intFromEnum(editorKey.ARROW_UP) 
-                else 
+                const target_key = if (c == @intFromEnum(editorKey.PAGE_UP))
+                    @intFromEnum(editorKey.ARROW_UP)
+                else
                     @intFromEnum(editorKey.ARROW_DOWN);
-                
+
                 editorMoveCursor(target_key);
             }
         },
 
-        @intFromEnum(editorKey.ARROW_UP),
-        @intFromEnum(editorKey.ARROW_DOWN),
-        @intFromEnum(editorKey.ARROW_LEFT),
-        @intFromEnum(editorKey.ARROW_RIGHT) => {
+        @intFromEnum(editorKey.ARROW_UP), @intFromEnum(editorKey.ARROW_DOWN), @intFromEnum(editorKey.ARROW_LEFT), @intFromEnum(editorKey.ARROW_RIGHT) => {
             editorMoveCursor(c);
         },
-        
+
         else => {},
     }
 }
 
-
-
-fn editorRefreshScreen(allocator:std.mem.Allocator) !void {
+fn editorRefreshScreen(allocator: std.mem.Allocator) !void {
+    try editorScroll();
     var ab = abuf.INIT;
     // clear screen and reposition cursor
-    try abAppend(allocator,&ab,"\x1b[?25L");
-    try abAppend(allocator,&ab,"\x1b[H");
-    
+    try abAppend(allocator, &ab, "\x1b[?25L");
+    try abAppend(allocator, &ab, "\x1b[H");
+
     // darw the tildeds
-    try editorDrawRows(allocator,&ab);
+    try editorDrawRows(allocator, &ab);
 
     var buf: [32]u8 = undefined;
-    const msg = try std.fmt.bufPrint(&buf,"\x1b[{d};{d}H",.{E.cy+1,E.cx+1});
+    const msg = try std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ (E.cy - E.rowoff) + 1, E.cx + 1 });
     try abAppend(allocator, &ab, msg);
 
     // move cursor back to top left
 
-    try abAppend(allocator,&ab,"\x1b[?25h");
+    try abAppend(allocator, &ab, "\x1b[?25h");
 
     // output complete buffer to terminal
-    _ = posix.write(posix.STDOUT_FILENO,ab.b) catch {};
+    _ = posix.write(posix.STDOUT_FILENO, ab.b) catch {};
 
     // clean up memory allocations
-    abFree(allocator,&ab);
+    abFree(allocator, &ab);
 }
+
+// TODO
+// continue from here : https://viewsourcecode.org/snaptoken/kilo/04.aTextViewer.html#horizontal-scrolling
 
 fn editorMoveCursor(key: c_int) void {
     switch (key) {
@@ -286,47 +306,77 @@ fn editorMoveCursor(key: c_int) void {
             if (E.cy != 0) E.cy -= 1;
         },
         @intFromEnum(editorKey.ARROW_DOWN) => {
-            if (E.cy != E.screenrows - 1) E.cy += 1;
+            if (E.cy < E.numrows) E.cy += 1;
         },
         else => {},
     }
 }
 
-
+fn editorScroll() !void {
+    if (E.cy < E.rowoff) {
+        E.rowoff = E.cy;
+    }
+    if (E.cy >= E.rowoff + E.screenrows) {
+        E.rowoff = E.cy - E.screenrows + 1;
+    }
+}
 
 fn editorDrawRows(allocator: std.mem.Allocator, ab: *abuf) !void {
     var y: c_int = 0;
+
+    // Loop through every single row row on the screen
     while (y < E.screenrows) : (y += 1) {
-        if (y == @divTrunc(E.screenrows, 3)) {
-            var welcome: [80]u8 = undefined;
-            const res = try std.fmt.bufPrint(&welcome, "Kilo editor -- version {s}", .{KILO_VERSION});
-            
-            var welcomelen = @as(c_int, @intCast(res.len));
-            if (welcomelen > E.screencols) welcomelen = E.screencols;
+        // Calculate the actual row index of the file we are currently rendering
+        const filerow: c_int = y + E.rowoff;
 
-            var padding = @divTrunc(E.screencols - welcomelen, 2);
-            if (padding > 0) {
+        // CASE 1: We are drawing BEYOND the text lines currently loaded in the file
+        if (filerow >= E.numrows) {
+            // Display the welcome message only if no file rows are loaded at all
+            if (E.numrows == 0 and y == @divTrunc(E.screenrows, 3)) {
+                var welcome: [80]u8 = undefined;
+                const res = try std.fmt.bufPrint(&welcome, "Kilo editor -- version {s}", .{KILO_VERSION});
+
+                var welcomelen = @as(c_int, @intCast(res.len));
+                if (welcomelen > E.screencols) welcomelen = E.screencols;
+
+                var padding = @divTrunc(E.screencols - welcomelen, 2);
+                if (padding > 0) {
+                    try abAppend(allocator, ab, "~");
+                    padding -= 1;
+                }
+
+                while (padding > 0) : (padding -= 1) {
+                    try abAppend(allocator, ab, " ");
+                }
+
+                try abAppend(allocator, ab, res[0..@as(usize, @intCast(welcomelen))]);
+            } else {
+                // Regular trailing line outside the file content gets a tilde
                 try abAppend(allocator, ab, "~");
-                padding -= 1;
             }
-            while (padding > 0) : (padding -= 1) {
-                try abAppend(allocator, ab, " ");
-            }
-
-            try abAppend(allocator, ab, res[0..@as(usize, @intCast(welcomelen))]);
         } else {
-            try abAppend(allocator, ab, "~");
+            // CASE 2: We are drawing an ACTUAL text line from our loaded buffe
+            const current_row = E.row[@as(usize, @intCast(filerow))];
+
+            // Extract the true length of the string from the slice metadata
+            var len = @as(c_int, @intCast(current_row.chars.len));
+            if (len > E.screencols) len = E.screencols;
+
+            // Slice out the text string up to the screen boundary and push to buffer
+            try abAppend(allocator, ab, current_row.chars[0..@as(usize, @intCast(len))]);
         }
 
+        // Clear the remainder of the current line from the cursor to the right margin
         try abAppend(allocator, ab, "\x1b[K");
+
+        // Append a newline carriage return for every row except the absolute last line
         if (y < E.screenrows - 1) {
             try abAppend(allocator, ab, "\r\n");
         }
     }
 }
 
-
-fn die(msg: []const u8, err:anyerror) noreturn {
+fn die(msg: []const u8, err: anyerror) noreturn {
     // clear screen on exit
     const stdout = std.io.getStdOut().writer();
     // Use 'catch {}' because a noreturn function cannot return an error (!) either
@@ -393,12 +443,21 @@ pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
     const stdin = std.io.getStdIn();
 
+    // fetch cla
+    const args = try std.process.argsAlloc(allocator);
+    // need to copy in zig cuz copies into safe memory or sum shit
+    defer std.process.argsFree(allocator, args); // auto freeing
+
     _ = try enableRawMode();
     try initEditor();
 
+    if (args.len >= 2) {
+        try editorOpen(allocator, args[1]);
+    }
+
     defer disableRawMode();
 
-    while (true){
+    while (true) {
         try editorRefreshScreen(allocator);
         try editorProcessKeypress();
     }
@@ -407,11 +466,11 @@ pub fn main() !void {
         var c: u8 = 0;
         // Read 1 byte from stdin
         const bytes_read = stdin.read(std.mem.asBytes(&c)) catch |err| {
-            if (err==error.WouldBlock){
+            if (err == error.WouldBlock) {
                 // wouldblock means the read timed out, so we just continue to the next iteration
                 continue;
             }
-            die("read",err);
+            die("read", err);
         };
 
         // If no bytes were read (timeout occurred), skip processing
