@@ -1,3 +1,37 @@
+// /* Kilo -- A very simple editor in less than 1-kilo lines of code (as counted
+//  *         by "cloc"). Does not depend on libcurses, directly emits VT100
+//  *         escapes on the terminal.
+//  *
+//  * -----------------------------------------------------------------------
+//  *
+//  * Copyright (C) 2016 Salvatore Sanfilippo <antirez at gmail dot com>
+//  *
+//  * All rights reserved.
+//  *
+//  * Redistribution and use in source and binary forms, with or without
+//  * modification, are permitted provided that the following conditions are
+//  * met:
+//  *
+//  *  *  Redistributions of source code must retain the above copyright
+//  *     notice, this list of conditions and the following disclaimer.
+//  *
+//  *  *  Redistributions in binary form must reproduce the above copyright
+//  *     notice, this list of conditions and the following disclaimer in the
+//  *     documentation and/or other materials provided with the distribution.
+//  *
+//  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+//  * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+//  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+//  * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+//  * HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+//  * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+//  * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+//  * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+//  * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+//  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+//  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//  */
+
 const std = @import("std");
 const posix = std.posix;
 const readit = @import("readit.zig"); // made this last year , finally came in use
@@ -8,15 +42,23 @@ const readit = @import("readit.zig"); // made this last year , finally came in u
 // FIXED: Added 'comptime' so this can be safely evaluated inside the switch pattern matcher
 
 pub const KILO_VERSION = "0.0.1";
+pub const KILO_TAB_STOP:c_int= 8;
 
 const erow = struct {
     chars: []u8,
+    size: c_int,
+    rsize: c_int,
+    render: []u8,
 };
 
 const EditorConfig = struct {
     cx: c_int = 0,
     cy: c_int = 0,
     rowoff: c_int = 0,
+    coloff: c_int = 0,
+    rx:c_int = 0,
+    // TODO
+    // https://viewsourcecode.org/snaptoken/kilo/04.aTextViewer.html#tabs-and-the-cursor
     screenrows: c_int = 0,
     screencols: c_int = 0,
     numrows: c_int = 0,
@@ -95,6 +137,33 @@ fn getCursorPosition(rows: *c_int, cols: *c_int) !c_int {
     return 0;
 }
 
+fn editorUpdateRow(allocator:std.mem.Allocator,row:*erow) !void {
+    allocator.free(row.render);
+    const tabs = std.mem.count(u8,row.chars,"\t");
+
+    const tab_size = @as(usize,@intCast(KILO_TAB_STOP));
+
+    row.render = try allocator.alloc(u8,row.chars.len+(tabs*(tab_size-1)));
+
+    // fill the new buffer and pad tabs out to trab stops
+    var idx:usize = 0;
+    for (row.chars) |c| {
+        if (c=='\t'){
+            row.render[idx]=' ';
+            idx+=1;
+            while (idx%tab_size!=0):(idx+=1){
+                row.render[idx]=' ';
+            }
+        }else{
+            row.render[idx]=c;
+            idx+=1;
+        }
+    }
+    // match final index count to row rendered ssize
+    row.rsize = @intCast(idx);
+}
+
+
 fn editorAppendRow(allocator: std.mem.Allocator, s: []const u8) !void {
     const at = @as(usize, @intCast(E.numrows));
     const new_row_count = at + 1;
@@ -104,7 +173,14 @@ fn editorAppendRow(allocator: std.mem.Allocator, s: []const u8) !void {
 
     const chars_copy = try allocator.dupe(u8, s);
 
-    E.row[at] = erow{ .chars = chars_copy };
+    E.row[at] = erow{
+        .size = @as(c_int, @intCast(s.len)),
+        .chars = chars_copy,
+        .rsize = 0,
+        .render = &[_]u8{}, // 
+    };
+
+    try editorUpdateRow(allocator,&E.row[at]);
 
     E.numrows += 1;
 }
@@ -160,6 +236,7 @@ fn initEditor() !void {
     E.cx = 0;
     E.cy = 0;
     E.rowoff = 0;
+    E.coloff = 0;
     E.numrows = 0;
     E.row = &[_]erow{};
 
@@ -268,39 +345,61 @@ fn editorProcessKeypress() !void {
 
 fn editorRefreshScreen(allocator: std.mem.Allocator) !void {
     try editorScroll();
+
     var ab = abuf.INIT;
-    // clear screen and reposition cursor
-    try abAppend(allocator, &ab, "\x1b[?25L");
+    // Defers cleanup so it always runs, preventing memory leaks on error
+    defer abFree(allocator, &ab);
+
+    // Fixed: changed capital 'L' to lowercase 'l'
+    try abAppend(allocator, &ab, "\x1b[?25l");
     try abAppend(allocator, &ab, "\x1b[H");
 
-    // darw the tildeds
+    // draw the tildes/text rows
     try editorDrawRows(allocator, &ab);
 
     var buf: [32]u8 = undefined;
-    const msg = try std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ (E.cy - E.rowoff) + 1, E.cx + 1 });
+    const msg = try std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ (E.cy - E.rowoff) + 1, (E.cx - E.coloff) + 1 });
     try abAppend(allocator, &ab, msg);
-
-    // move cursor back to top left
 
     try abAppend(allocator, &ab, "\x1b[?25h");
 
     // output complete buffer to terminal
     _ = posix.write(posix.STDOUT_FILENO, ab.b) catch {};
-
-    // clean up memory allocations
-    abFree(allocator, &ab);
 }
 
 // TODO
 // continue from here : https://viewsourcecode.org/snaptoken/kilo/04.aTextViewer.html#horizontal-scrolling
 
 fn editorMoveCursor(key: c_int) void {
+    const row: ?*erow = if (E.cy < E.numrows) &E.row[@intCast(E.cy)] else null;
+
     switch (key) {
         @intFromEnum(editorKey.ARROW_LEFT) => {
-            if (E.cx != 0) E.cx -= 1;
+            if (E.cx != 0) {
+                E.cx -= 1;
+            } else if (E.cy > 0) {
+                // 1. Move up to the previous line
+                E.cy = E.cy - 1;
+
+                const target_row_index = @as(usize, @intCast(E.cy));
+                const previous_row = E.row[target_row_index];
+
+                E.cx = @as(c_int, @intCast(previous_row.chars.len));
+            }
         },
         @intFromEnum(editorKey.ARROW_RIGHT) => {
-            if (E.cx != E.screencols - 1) E.cx += 1;
+            if (row) |r| {
+                if (E.cx < r.chars.len) {
+                    E.cx += 1;
+                }
+            } else if (row) |r| {
+                const row_len = @as(c_int, @intCast(r.chars.len));
+
+                if (E.cx == row_len) {
+                    E.cy += 1;
+                    E.cx = 0;
+                }
+            }
         },
         @intFromEnum(editorKey.ARROW_UP) => {
             if (E.cy != 0) E.cy -= 1;
@@ -310,6 +409,11 @@ fn editorMoveCursor(key: c_int) void {
         },
         else => {},
     }
+    const rowlen = if (row) |r| r.chars.len else 0;
+
+    if (E.cx > @as(c_int, @intCast(rowlen))) {
+        E.cx = @as(c_int, @intCast(rowlen));
+    }
 }
 
 fn editorScroll() !void {
@@ -318,6 +422,12 @@ fn editorScroll() !void {
     }
     if (E.cy >= E.rowoff + E.screenrows) {
         E.rowoff = E.cy - E.screenrows + 1;
+    }
+    if (E.cx < E.coloff) {
+        E.coloff = E.cx;
+    }
+    if (E.cx >= E.coloff + E.screencols) {
+        E.coloff = E.cx - E.screencols + 1;
     }
 }
 
@@ -355,15 +465,26 @@ fn editorDrawRows(allocator: std.mem.Allocator, ab: *abuf) !void {
                 try abAppend(allocator, ab, "~");
             }
         } else {
-            // CASE 2: We are drawing an ACTUAL text line from our loaded buffe
-            const current_row = E.row[@as(usize, @intCast(filerow))];
+            const current_row = E.row[@as(usize,@intCast(filerow))];
 
-            // Extract the true length of the string from the slice metadata
-            var len = @as(c_int, @intCast(current_row.chars.len));
-            if (len > E.screencols) len = E.screencols;
+            const u_coloff = @as(usize,@intCast(E.coloff));
 
-            // Slice out the text string up to the screen boundary and push to buffer
-            try abAppend(allocator, ab, current_row.chars[0..@as(usize, @intCast(len))]);
+            var len: usize = 0;
+
+            const u_rsize = @as(usize,@intCast(current_row.size));
+
+            if (u_rsize>u_coloff){
+                len = u_rsize-u_coloff;
+            }
+
+            if (len>@as(usize,@intCast(E.screencols))){
+                len = @as(usize,@intCast(E.screencols));
+            }
+
+            if (len>0){
+                const end = u_coloff+len;
+                try abAppend(allocator, ab, current_row.render[u_coloff..end]);
+            }
         }
 
         // Clear the remainder of the current line from the cursor to the right margin
