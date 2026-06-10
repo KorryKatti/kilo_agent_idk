@@ -164,6 +164,52 @@ fn editorUpdateRow(allocator: std.mem.Allocator, row: *erow) !void {
     row.rsize = @intCast(idx);
 }
 
+// insert single character into row at given position
+// if out of boudns append to end of row
+fn editorRowInsertChar(allocator: std.mem.Allocator, row: *erow, at: c_int, c: u8) !void {
+    // clamp insertion point to validate range
+    var insert_pos = at;
+    if (insert_pos < 0 or insert_pos > row.size) {
+        insert_pos = row.size;
+    }
+
+    const pos = @as(usize, @intCast(insert_pos));
+    const current_size = @as(usize, @intCast(row.size));
+
+    // reallocate +1 for new char , +1 for null terminator
+    const new_chars = try allocator.realloc(row.chars, current_size + 2);
+
+    // shift everything from insert_pos onward one byte to the right
+    const src = new_chars[pos .. current_size + 1]; // +1 to include existing null if present
+    const dst = new_chars[pos + 1 .. current_size + 2];
+    std.mem.copyForwards(u8, dst, src);
+
+    // insert new character
+    new_chars[pos] = c;
+
+    // update row metadata
+    row.chars = new_chars;
+    row.size += 1;
+
+    // rebuild rendered version
+    try editorUpdateRow(allocator, row); // crazy how much things goes to insert a character man damn
+}
+
+// insert character at current cursor positions
+// if cursor on new line past the end of file , create enmpty road first
+fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
+    // if cursor belwo all existing rows , append a new empty row
+    if (E.cy == E.numrows) {
+        try editorAppendRow(allocator, "");
+    }
+    // insert the character into current row at cursor column
+    const row_index = @as(usize, @intCast(E.cy));
+    try editorRowInsertChar(allocator, &E.row[row_index], E.cx, c);
+
+    // advance cursor one column to right
+    E.cx += 1;
+}
+
 fn editorAppendRow(allocator: std.mem.Allocator, s: []const u8) !void {
     const at = @as(usize, @intCast(E.numrows));
     const new_row_count = at + 1;
@@ -206,6 +252,11 @@ fn getWindowSize(rows: *c_int, cols: *c_int) !c_int {
         return 0;
     }
 }
+
+// dont have much time today
+// will do later
+// TODO
+// https://viewsourcecode.org/snaptoken/kilo/05.aTextEditor.html#save-to-disk
 
 fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
 
@@ -273,7 +324,7 @@ fn editorRowCxToRx(row: *erow, cx: c_int) c_int {
     return rx;
 }
 
-const editorKey = enum(c_int) { ARROW_LEFT = 1000, ARROW_RIGHT, ARROW_UP, ARROW_DOWN, DEL_KEY, HOME_KEY, END_KEY, PAGE_UP, PAGE_DOWN };
+const editorKey = enum(c_int) {BACKSPACE=127, ARROW_LEFT = 1000, ARROW_RIGHT, ARROW_UP, ARROW_DOWN, DEL_KEY, HOME_KEY, END_KEY, PAGE_UP, PAGE_DOWN };
 
 fn editorReadKey() !c_int {
     var c: u8 = 0;
@@ -340,6 +391,7 @@ fn editorProcessKeypress() !void {
     const c = try editorReadKey();
 
     switch (c) {
+        '\r'=>{},
         ctrlKey('q') => {
             _ = posix.write(posix.STDOUT_FILENO, "\x1b[2J") catch {};
             _ = posix.write(posix.STDOUT_FILENO, "\x1b[H") catch {};
@@ -352,6 +404,12 @@ fn editorProcessKeypress() !void {
             if (E.cy < E.numrows) {
                 E.cx = E.row[@intCast(E.cy)].size;
             }
+        },
+
+        @intFromEnum(editorKey.BACKSPACE),
+        ctrlKey('h'),
+        @intFromEnum(editorKey.DEL_KEY)=>{
+
         },
 
         @intFromEnum(editorKey.PAGE_UP), @intFromEnum(editorKey.PAGE_DOWN) => {
@@ -379,11 +437,22 @@ fn editorProcessKeypress() !void {
             editorMoveCursor(c);
         },
 
-        else => {},
+        '\x1b',
+        ctrlKey('l')=>{
+
+        },
+
+        else => {
+            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const allocator = gpa.allocator();
+            try editorInsertChar(allocator, @intCast(c));
+
+        },
     }
 }
 
-fn editorDrawMessageBar(allocator:std.mem.Allocator,ab:*abuf)!void{
+fn editorDrawMessageBar(allocator: std.mem.Allocator, ab: *abuf) !void {
     try abAppend(allocator, ab, "\x1b[K");
     // Calculate how long the status message actually is
     var msglen: usize = 0;
