@@ -43,6 +43,7 @@ const readit = @import("readit.zig"); // made this last year , finally came in u
 
 pub const KILO_VERSION = "0.0.1";
 pub const KILO_TAB_STOP: c_int = 8;
+pub const KILO_QUIT_TIMES: c_int = 3;
 
 const erow = struct {
     chars: []u8,
@@ -60,6 +61,7 @@ const EditorConfig = struct {
     filename: ?[]u8 = null,
     screenrows: c_int = 0,
     screencols: c_int = 0,
+    dirty: c_int = 0,
     numrows: c_int = 0,
     row: []erow = &[_]erow{}, // an empty slice to start with
     statusmsg: [80]u8 = [_]u8{0} ** 80,
@@ -193,6 +195,162 @@ fn editorRowInsertChar(allocator: std.mem.Allocator, row: *erow, at: c_int, c: u
 
     // rebuild rendered version
     try editorUpdateRow(allocator, row); // crazy how much things goes to insert a character man damn
+    E.dirty += 1;
+}
+
+/// Handles the Enter key: splits the current line or inserts an empty line.
+fn editorInsertNewline(allocator: std.mem.Allocator) !void {
+    // If cursor is at the start of the line, insert an empty line above
+    if (E.cx == 0) {
+        try editorInsertRow(allocator, E.cy, "");
+    } else {
+        // Cursor is in the middle or end of the line — split it
+        const row_index = @as(usize, @intCast(E.cy));
+        const row = &E.row[row_index];
+
+        // Get the text after the cursor: this becomes the new line
+        const split_pos = @as(usize, @intCast(E.cx));
+        const remaining = row.chars[split_pos..@as(usize, @intCast(row.size))];
+
+        // Insert a new row below with the remaining text
+        try editorInsertRow(allocator, E.cy + 1, remaining);
+
+        // Truncate current row to keep only text before cursor
+        // Realloc to shrink buffer and add null terminator
+        const new_chars = try allocator.realloc(row.chars, split_pos + 1);
+        row.chars = new_chars;
+        row.size = E.cx;
+        row.chars[@as(usize, @intCast(row.size))] = 0;
+
+        // Rebuild rendered version of the truncated row
+        try editorUpdateRow(allocator, row);
+    }
+
+    // Move cursor to the start of the newly created line
+    E.cy += 1;
+    E.cx = 0;
+}
+
+// simple backspaces
+/// Deletes a single character from a row at the given position.
+/// Shifts all characters after `at` one position left to close the gap.
+fn editorRowDelChar(allocator: std.mem.Allocator, row: *erow, at: c_int) void {
+    // Guard: can't delete before start or past end of row
+    if (at < 0 or at >= row.size) {
+        return;
+    }
+
+    const pos = @as(usize, @intCast(at));
+    const current_size = @as(usize, @intCast(row.size));
+
+    // Shift everything from pos+1 leftward by one byte
+    // This overwrites the char at `pos` with the char at `pos+1`
+    const src = row.chars[pos + 1 .. current_size];
+    const dst = row.chars[pos .. current_size - 1];
+    std.mem.copyForwards(u8, dst, src);
+
+    // Shrink the allocation to match new size
+    const new_chars = allocator.realloc(row.chars, current_size - 1) catch row.chars[0 .. current_size - 1];
+    row.chars = new_chars;
+
+    // Update row metadata
+    row.size -= 1;
+
+    // Rebuild rendered version (tabs expanded, etc.)
+    editorUpdateRow(allocator, row) catch {};
+
+    // Mark buffer as modified (any non-zero means dirty)
+    E.dirty += 1;
+}
+
+/// Frees all heap-allocated memory owned by a single row.
+fn editorFreeRow(allocator: std.mem.Allocator, row: *erow) void {
+    // Free the tab-expanded render buffer
+    allocator.free(row.render);
+
+    // Free the raw character buffer
+    allocator.free(row.chars);
+}
+
+/// Deletes an entire row from the editor, shifting all rows below it up.
+fn editorDelRow(allocator: std.mem.Allocator, at: c_int) void {
+    // Guard: row index must be within valid bounds
+    if (at < 0 or at >= E.numrows) {
+        return;
+    }
+
+    const pos = @as(usize, @intCast(at));
+    const numrows = @as(usize, @intCast(E.numrows));
+
+    // Free the row's allocated memory before overwriting it
+    editorFreeRow(allocator, &E.row[pos]);
+
+    // Shift all rows after `at` up by one position to close the gap
+    // This overwrites the deleted row with the one below it
+    const src = E.row[pos + 1 .. numrows];
+    const dst = E.row[pos .. numrows - 1];
+    std.mem.copyForwards(erow, dst, src);
+
+    // Shrink the row array to match new count
+    const new_rows = allocator.realloc(E.row, numrows - 1) catch E.row[0 .. numrows - 1];
+    E.row = new_rows;
+
+    // Update editor state
+    E.numrows -= 1;
+    E.dirty += 1;
+}
+
+/// Deletes the character to the left of the cursor (backspace behavior).
+/// If cursor is at the start of a line, this currently does nothing.
+fn editorDelChar(allocator: std.mem.Allocator) !void {
+    // Can't delete if cursor is past the last row (on the tilde lines)
+    if (E.cy == E.numrows) {
+        return;
+    }
+    if (E.cx == 0 and E.cy == 0) {
+        return;
+    }
+
+    const row_index = @as(usize, @intCast(E.cy));
+    const row = &E.row[row_index];
+
+    // Only delete if there's a character to the left of the cursor
+    if (E.cx > 0) {
+        // Delete the character at cx - 1 (one position left of cursor)
+        editorRowDelChar(allocator, row, E.cx - 1);
+
+        // Move cursor left to fill the gap
+        E.cx -= 1;
+    } else {
+        E.cx = E.row[@intCast(E.cy - 1)].size;
+        try editorRowAppendString(allocator, &E.row[@intCast(E.cy - 1)], row.chars);
+        editorDelRow(allocator, E.cy);
+        E.cy -= 1;
+    }
+}
+
+// append a string to the end of rows character buffer
+// i am gonna stop pretending i even understand half of the thing i am doing
+fn editorRowAppendString(allocator: std.mem.Allocator, row: *erow, s: []const u8) !void {
+    const current_size = @as(usize, @intCast(row.size));
+    const append_len = s.len;
+
+    // grow the buffer : current size + new tex
+    const new_chars = try allocator.realloc(row.chars, current_size + append_len + 1);
+    row.chars = new_chars;
+
+    // copy new string at end of existing content
+    @memcpy(row.chars[current_size .. current_size + append_len], s);
+
+    // update size and add null termination , idk if we need this in zig ??
+    row.size += @as(c_int, @intCast(append_len));
+    row.chars[@as(usize, @intCast(row.size))] = 0;
+
+    // rebuild rendered version
+    try editorUpdateRow(allocator, row);
+
+    // modified
+    E.dirty += 1;
 }
 
 // insert character at current cursor positions
@@ -200,7 +358,7 @@ fn editorRowInsertChar(allocator: std.mem.Allocator, row: *erow, at: c_int, c: u
 fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
     // if cursor belwo all existing rows , append a new empty row
     if (E.cy == E.numrows) {
-        try editorAppendRow(allocator, "");
+        try editorInsertRow(allocator, E.numrows, "");
     }
     // insert the character into current row at cursor column
     const row_index = @as(usize, @intCast(E.cy));
@@ -208,6 +366,48 @@ fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
 
     // advance cursor one column to right
     E.cx += 1;
+}
+
+/// Inserts a new row at position `at` with the given string content.
+/// Shifts all rows at and after `at` down by one position.
+fn editorInsertRow(allocator: std.mem.Allocator, at: c_int, s: []const u8) !void {
+    // Guard: row index must be within valid bounds (0 to numrows, inclusive for append)
+    if (at < 0 or at > E.numrows) {
+        return;
+    }
+
+    const pos = @as(usize, @intCast(at));
+    const numrows = @as(usize, @intCast(E.numrows));
+
+    // Grow the row array to make room for one more row
+    const new_rows = try allocator.realloc(E.row, numrows + 1);
+    E.row = new_rows;
+
+    // Shift all rows from pos onward down by one slot
+    // This opens a hole at `pos` for the new row
+    const src = E.row[pos..numrows];
+    const dst = E.row[pos + 1 .. numrows + 1];
+    std.mem.copyBackwards(erow, dst, src);
+
+    // Allocate and copy the character content for the new row
+    const chars = try allocator.alloc(u8, s.len + 1);
+    @memcpy(chars[0..s.len], s);
+    chars[s.len] = 0; // null terminator
+
+    // Initialize the new row in the opened slot
+    E.row[pos] = erow{
+        .size = @as(c_int, @intCast(s.len)),
+        .chars = chars,
+        .rsize = 0,
+        .render = &[_]u8{},
+    };
+
+    // Build the rendered version
+    try editorUpdateRow(allocator, &E.row[pos]);
+
+    // Update editor state
+    E.numrows += 1;
+    E.dirty += 1;
 }
 
 fn editorAppendRow(allocator: std.mem.Allocator, s: []const u8) !void {
@@ -229,6 +429,7 @@ fn editorAppendRow(allocator: std.mem.Allocator, s: []const u8) !void {
     try editorUpdateRow(allocator, &E.row[at]);
 
     E.numrows += 1;
+    E.dirty += 1;
 }
 
 fn getWindowSize(rows: *c_int, cols: *c_int) !c_int {
@@ -253,32 +454,105 @@ fn getWindowSize(rows: *c_int, cols: *c_int) !c_int {
     }
 }
 
-// dont have much time today
-// will do later
-// TODO
-// https://viewsourcecode.org/snaptoken/kilo/05.aTextEditor.html#save-to-disk
+// concetenate all rows into a single string with newline between them
+fn editorRowsToString(allocator: std.mem.Allocator, buflen: *usize) ![]u8 {
+    // calculate total bytes needed
+    var totlen: usize = 0;
+    var j: c_int = 0;
+    while (j < E.numrows) : (j += 1) {
+        const row_index = @as(usize, @intCast(j));
+        // each row attributes its size plus 1 byte for '\n'
+        totlen += @as(usize, @intCast(E.row[row_index].size)) + 1;
+    }
+    // return totla length to caller
+    buflen.* = totlen;
+    // allocates full biuffer in one shot
+    var buf = try allocator.alloc(u8, totlen);
+    // istg i keep coming back to zig for some stupid reason and i hate memory mamanget i will switch to nim , i dont know whu i am keep comng back to this
+    // secon press : copy each row and append new line
+    var p: usize = 0; // current write positon in buf
+    j = 0;
+
+    while (j < E.numrows) : (j += 1) {
+        const row_index = @as(usize, @intCast(j));
+        const row = E.row[row_index];
+        const row_size = @as(usize, @intCast(row.size));
+
+        // copy the rows characters int othe buffer
+        @memcpy(buf[p .. p + row_size], row.chars[0..row_size]);
+        p += row_size;
+
+        // append new line
+        buf[p] = '\n';
+        p += 1;
+    }
+    return buf;
+}
+
+fn editorSave(allocator: std.mem.Allocator) !void {
+    if (E.filename == null) {
+        E.filename = try editorPrompt(allocator,"Save as: %s (ESC t cancel)");
+        if (E.filename==null){
+            editorSetStatusMessage("save aborted", .{});
+            return;
+        }
+    }
+
+    const filename = E.filename orelse {
+        editorSetStatusMessage("No filename", .{});
+        return;
+    };
+
+    var len: usize = 0;
+    const buf = try editorRowsToString(allocator, &len);
+    defer allocator.free(buf);
+
+    const fd = posix.open(filename, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o644) catch |err| {
+        editorSetStatusMessage("Can't save! I/O error: {s}", .{@errorName(err)});
+        return;
+    };
+    defer posix.close(fd);
+
+    posix.ftruncate(fd, @intCast(len)) catch |err| {
+        editorSetStatusMessage("Can't save! I/O error: {s}", .{@errorName(err)});
+        return;
+    };
+
+    const written = posix.write(fd, buf) catch |err| {
+        editorSetStatusMessage("Can't save! I/O error: {s}", .{@errorName(err)});
+        return;
+    };
+
+    if (written != len) {
+        editorSetStatusMessage("Can't save! I/O error: incomplete write", .{});
+        return;
+    }
+    E.dirty = 0;
+    editorSetStatusMessage("{d} bytes written to disk", .{len});
+}
 
 fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
-
-    // free old filename
+    // Free old filename if we had one
     if (E.filename) |old_name| {
         allocator.free(old_name);
     }
+    // Duplicate new filename into owned memory
     E.filename = try allocator.dupe(u8, filename);
 
     var lines = try readit.readLines(allocator, filename);
-
     defer lines.deinit();
 
     for (lines.items) |raw_line| {
         var line = raw_line;
 
-        if (line.len > 0 and line[line.len - 1] == '\r') {
+        while (line.len > 0 and (line[line.len - 1] == '\n' or line[line.len - 1] == '\r')) {
             line = line[0 .. line.len - 1];
         }
 
-        try editorAppendRow(allocator, line);
+        try editorInsertRow(allocator, E.numrows, line);
     }
+
+    E.dirty = 0;
 }
 
 // to get size of the terminal
@@ -301,6 +575,7 @@ fn initEditor() !void {
     E.filename = &[_]u8{};
     E.statusmsg[0] = 0;
     E.statusmsg_time = 0;
+    E.dirty = 0;
 
     // Pass pointers directly, just like C
     if (try getWindowSize(&E.screenrows, &E.screencols) == -1) {
@@ -324,7 +599,7 @@ fn editorRowCxToRx(row: *erow, cx: c_int) c_int {
     return rx;
 }
 
-const editorKey = enum(c_int) {BACKSPACE=127, ARROW_LEFT = 1000, ARROW_RIGHT, ARROW_UP, ARROW_DOWN, DEL_KEY, HOME_KEY, END_KEY, PAGE_UP, PAGE_DOWN };
+const editorKey = enum(c_int) { BACKSPACE = 127, ARROW_LEFT = 1000, ARROW_RIGHT, ARROW_UP, ARROW_DOWN, DEL_KEY, HOME_KEY, END_KEY, PAGE_UP, PAGE_DOWN };
 
 fn editorReadKey() !c_int {
     var c: u8 = 0;
@@ -386,16 +661,37 @@ fn editorReadKey() !c_int {
         return c;
     }
 }
-
+var quit_times: i32 = KILO_QUIT_TIMES;
 fn editorProcessKeypress() !void {
+
+    // no static variable ?
+
     const c = try editorReadKey();
 
     switch (c) {
-        '\r'=>{},
-        ctrlKey('q') => {
+        '\r' => {
+            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const allocator = gpa.allocator();
+            try editorInsertNewline(allocator);
+        },
+        ctrlKey('x') => {
+            if (E.dirty > 0 and quit_times > 0) {
+                editorSetStatusMessage("WARNING!!! File has unsaved changes. Press ctrl-x {d} more times to quit. ", .{quit_times});
+                quit_times -= 1;
+                return;
+            }
+
             _ = posix.write(posix.STDOUT_FILENO, "\x1b[2J") catch {};
             _ = posix.write(posix.STDOUT_FILENO, "\x1b[H") catch {};
             std.process.exit(0);
+        },
+
+        ctrlKey('s') => {
+            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const allocator = gpa.allocator();
+            try editorSave(allocator);
         },
 
         @intFromEnum(editorKey.HOME_KEY) => E.cx = 0,
@@ -406,10 +702,15 @@ fn editorProcessKeypress() !void {
             }
         },
 
-        @intFromEnum(editorKey.BACKSPACE),
-        ctrlKey('h'),
-        @intFromEnum(editorKey.DEL_KEY)=>{
+        @intFromEnum(editorKey.BACKSPACE), ctrlKey('h'), @intFromEnum(editorKey.DEL_KEY) => {
+            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const allocator = gpa.allocator();
+            if (c == @intFromEnum(editorKey.DEL_KEY)) {
+                editorMoveCursor(@intFromEnum(editorKey.ARROW_RIGHT));
+            }
 
+            try editorDelChar(allocator);
         },
 
         @intFromEnum(editorKey.PAGE_UP), @intFromEnum(editorKey.PAGE_DOWN) => {
@@ -437,19 +738,16 @@ fn editorProcessKeypress() !void {
             editorMoveCursor(c);
         },
 
-        '\x1b',
-        ctrlKey('l')=>{
-
-        },
+        '\x1b', ctrlKey('l') => {},
 
         else => {
             var gpa = std.heap.GeneralPurposeAllocator(.{}){};
             defer _ = gpa.deinit();
             const allocator = gpa.allocator();
             try editorInsertChar(allocator, @intCast(c));
-
         },
     }
+    quit_times = KILO_QUIT_TIMES;
 }
 
 fn editorDrawMessageBar(allocator: std.mem.Allocator, ab: *abuf) !void {
@@ -476,18 +774,17 @@ fn editorDrawStatusBar(allocator: std.mem.Allocator, ab: *abuf) !void {
     // Enable reverse video (inverted colors) for the status bar
     try abAppend(allocator, ab, "\x1b[7m");
 
-    // --- Left side: filename and line count ---
+    // --- Left side: filename, line count, and dirty marker ---
     var status: [80]u8 = undefined;
 
-    const filename_display = if (E.filename) |name|
-        name
-    else
-        "[No Name]";
+    const filename_display = E.filename orelse "[No Name]";
+    const dirty_marker = if (E.dirty > 0) " (modified)" else "";
 
     // {s:.20} truncates filename to 20 chars max
-    const formatted = try std.fmt.bufPrint(&status, "{s:.20} - {d} lines", .{
+    const formatted = try std.fmt.bufPrint(&status, "{s:.20} - {d} lines{s}", .{
         filename_display,
         E.numrows,
+        dirty_marker,
     });
 
     var len = @as(c_int, @intCast(formatted.len));
@@ -522,6 +819,8 @@ fn editorDrawStatusBar(allocator: std.mem.Allocator, ab: *abuf) !void {
 
     // Reset all text attributes back to normal
     try abAppend(allocator, ab, "\x1b[m");
+
+    // Move cursor to next line so message bar can draw on its own row
     try abAppend(allocator, ab, "\r\n");
 }
 
@@ -565,6 +864,57 @@ fn editorSetStatusMessage(comptime fmt: []const u8, args: anytype) void {
 
     // record current timestamp
     E.statusmsg_time = std.time.timestamp();
+}
+
+// ask the user for input at bottom of screen
+fn editorPrompt(allocator: std.mem.Allocator, prompt: []const u8) !?[]u8 {
+    // Start with a 128-byte buffer, grow dynamically as needed
+    var bufsize: usize = 128;
+    var buf = try allocator.alloc(u8, bufsize);
+
+    // Track actual string length (not buffer capacity)
+    var buflen: usize = 0;
+    buf[0] = 0; // null terminator so bufPrint treats it as empty string
+
+    while (true) {
+        // Show prompt + current input in status bar
+        editorSetStatusMessage("{s}{s}", .{ prompt, buf[0..buflen] });
+        try editorRefreshScreen(allocator);
+
+        const c = try editorReadKey();
+
+        if (c==@intFromEnum(editorKey.DEL_KEY) or c==ctrlKey('h') or c==@intFromEnum(editorKey.BACKSPACE)){
+            if (buflen!=0){
+                buflen-=1;
+            }
+        }
+        else if (c=='\x1b'){
+            editorSetStatusMessage("", .{});
+            allocator.free(buf);
+            return null;
+        }
+        else if (c == '\r') {
+            // Enter pressed: return buffer if non-empty
+            if (buflen != 0) {
+                editorSetStatusMessage("", .{});
+                // Shrink to exact size before returning (optional but tidy)
+                const exact = try allocator.realloc(buf, buflen + 1);
+                return exact;
+            }
+            // Empty input on Enter: keep prompting (don't return)
+        } else if (!std.ascii.isControl(@intCast(c)) and c < 128) {
+            // Printable ASCII character: append to buffer
+            if (buflen == bufsize - 1) {
+                // Buffer full: double the capacity
+                bufsize *= 2;
+                buf = try allocator.realloc(buf, bufsize);
+            }
+            buf[buflen] = @intCast(c);
+            buflen += 1;
+            buf[buflen] = 0; // maintain null terminator
+        }
+        // All other keys (arrows, escape, etc.) are ignored
+    }
 }
 
 fn editorMoveCursor(key: c_int) void {
