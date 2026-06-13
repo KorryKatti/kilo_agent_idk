@@ -1,4 +1,4 @@
-*.beam
-*.ez
-/build
-erl_crash.dump
+agent
+*.exe
+*.test
+*.prof
