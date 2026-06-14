@@ -531,6 +531,39 @@ fn editorSave(allocator: std.mem.Allocator) !void {
     editorSetStatusMessage("{d} bytes written to disk", .{len});
 }
 
+// searches for querty string in rendered text of all rows
+// moves cursor to the first match. esc cancels the prompt
+fn editorFind(allocator: std.mem.Allocator) !void {
+    // 1. Unwrap the optional query or exit early if null
+    const query = (editorPrompt(allocator, "Search: ") catch return) orelse return;
+    defer allocator.free(query);
+
+    // search through every row
+    var i: c_int = 0;
+    while (i < E.numrows) : (i += 1) {
+        const row_index = @as(usize, @intCast(i));
+        const row = &E.row[row_index];
+
+        // search in rendered text
+        const match = std.mem.indexOf(u8, row.render, query);
+
+        if (match) |match_index| {
+            // found it and move cursor to match position
+            E.cy = i;
+            
+            // 2. Corrected to use match_index instead of the function pointer 'match'
+            E.cx = editorRowRxToCx(row, @as(c_int, @intCast(match_index)));
+
+
+            // scroll so match is visible : jump rowoff to bottom let scroll logic pull it up
+            E.rowoff = E.numrows;
+            break; // stop at first match
+        }
+    }
+}
+
+
+
 fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
     // Free old filename if we had one
     if (E.filename) |old_name| {
@@ -597,6 +630,30 @@ fn editorRowCxToRx(row: *erow, cx: c_int) c_int {
         rx += 1;
     }
     return rx;
+}
+
+// hmm
+// converts a rendered screen column (rx) back to a character index(cx)
+// inverse of editorRowCxToRx . handles tab expansion
+fn editorRowRxToCx(row:*erow,rx:c_int) c_int {
+    var cur_rx:c_int = 0; // current rendered column as we walk
+    var cx: c_int  = 0; // character index we are calcuating
+
+    // walk through each raw charactarter , accimumonating rendered columns
+    while (cx<row.size) : (cx+=1){
+        // if this char is a tab  add the padding to reach the next tab stop 
+        if (row.chars[@intCast(cx)]=='\t'){
+            cur_rx+=(KILO_TAB_STOP-1)-@rem(cur_rx,KILO_TAB_STOP);
+        }
+        // every character ( tab or normal ) advances at least 1 rendered column
+        cur_rx+=1;
+        // if we passed the target rx , the previous cx was the answer
+        if (cur_rx>rx){
+            return cx;
+        }
+    }
+    // rx is past the end of the line: return the last valid cx
+    return cx;
 }
 
 const editorKey = enum(c_int) { BACKSPACE = 127, ARROW_LEFT = 1000, ARROW_RIGHT, ARROW_UP, ARROW_DOWN, DEL_KEY, HOME_KEY, END_KEY, PAGE_UP, PAGE_DOWN };
@@ -700,6 +757,13 @@ fn editorProcessKeypress() !void {
             if (E.cy < E.numrows) {
                 E.cx = E.row[@intCast(E.cy)].size;
             }
+        },
+
+        ctrlKey('f')=>{
+            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const allocator = gpa.allocator();
+            try editorFind(allocator);
         },
 
         @intFromEnum(editorKey.BACKSPACE), ctrlKey('h'), @intFromEnum(editorKey.DEL_KEY) => {
@@ -1129,7 +1193,7 @@ pub fn main() !void {
     }
 
     // Show initial help message in the status bar
-    editorSetStatusMessage("HELP: Ctrl-X = quit", .{});
+    editorSetStatusMessage("HELP: Ctrl-X = quit | Ctrl-S = save | Ctrl-F = find", .{});
 
     // Main event loop: draw screen, wait for input, repeat forever
     while (true) {
