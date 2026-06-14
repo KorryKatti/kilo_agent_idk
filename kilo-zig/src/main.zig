@@ -491,7 +491,7 @@ fn editorRowsToString(allocator: std.mem.Allocator, buflen: *usize) ![]u8 {
 
 fn editorSave(allocator: std.mem.Allocator) !void {
     if (E.filename == null) {
-        E.filename = try editorPrompt(allocator,"Save as: %s (ESC t cancel)");
+        E.filename = try editorPrompt(allocator,"Save as: %s (ESC t cancel)", null);
         if (E.filename==null){
             editorSetStatusMessage("save aborted", .{});
             return;
@@ -531,38 +531,68 @@ fn editorSave(allocator: std.mem.Allocator) !void {
     editorSetStatusMessage("{d} bytes written to disk", .{len});
 }
 
-// searches for querty string in rendered text of all rows
+// searches for query string in rendered text of all rows
 // moves cursor to the first match. esc cancels the prompt
-fn editorFind(allocator: std.mem.Allocator) !void {
-    // 1. Unwrap the optional query or exit early if null
-    const query = (editorPrompt(allocator, "Search: ") catch return) orelse return;
-    defer allocator.free(query);
+var find_last_match: c_int = -1;
+var find_direction: c_int = 1;
 
-    // search through every row
+fn editorFindCallback(query: []const u8, key: c_int) void {
+    if (key == '\r' or key == '\x1b') {
+        find_last_match = -1;
+        find_direction = 1;
+        return;
+    } else if (key == @intFromEnum(editorKey.ARROW_RIGHT) or key == @intFromEnum(editorKey.ARROW_DOWN)) {
+        find_direction = 1;
+    } else if (key == @intFromEnum(editorKey.ARROW_LEFT) or key == @intFromEnum(editorKey.ARROW_UP)) {
+        find_direction = -1;
+    } else {
+        find_last_match = -1;
+        find_direction = 1;
+    }
+
+    if (find_last_match == -1) find_direction = 1;
+    var current = find_last_match;
+
     var i: c_int = 0;
     while (i < E.numrows) : (i += 1) {
-        const row_index = @as(usize, @intCast(i));
+        current += find_direction;
+        if (current == -1) {
+            current = E.numrows - 1;
+        } else if (current == E.numrows) {
+            current = 0;
+        }
+
+        const row_index = @as(usize, @intCast(current));
         const row = &E.row[row_index];
 
-        // search in rendered text
-        const match = std.mem.indexOf(u8, row.render, query);
+        const match = std.mem.indexOf(u8, row.render[0..@as(usize, @intCast(row.rsize))], query);
 
         if (match) |match_index| {
-            // found it and move cursor to match position
-            E.cy = i;
-            
-            // 2. Corrected to use match_index instead of the function pointer 'match'
+            find_last_match = current;
+            E.cy = current;
             E.cx = editorRowRxToCx(row, @as(c_int, @intCast(match_index)));
-
-
-            // scroll so match is visible : jump rowoff to bottom let scroll logic pull it up
             E.rowoff = E.numrows;
-            break; // stop at first match
+            break;
         }
     }
 }
 
+fn editorFind(allocator: std.mem.Allocator) !void {
+    const saved_cx = E.cx;
+    const saved_cy = E.cy;
+    const saved_coloff = E.coloff;
+    const saved_rowoff = E.rowoff;
 
+    const query = (editorPrompt(allocator, "Search: %s (Use ESC/Arrows/Enter)", editorFindCallback) catch return);
+    if (query) |q| {
+        allocator.free(q);
+    } else {
+        E.cx = saved_cx;
+        E.cy = saved_cy;
+        E.coloff = saved_coloff;
+        E.rowoff = saved_rowoff;
+    }
+}
 
 fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
     // Free old filename if we had one
@@ -931,7 +961,9 @@ fn editorSetStatusMessage(comptime fmt: []const u8, args: anytype) void {
 }
 
 // ask the user for input at bottom of screen
-fn editorPrompt(allocator: std.mem.Allocator, prompt: []const u8) !?[]u8 {
+const PromptCallback = *const fn ([]const u8, c_int) void;
+
+fn editorPrompt(allocator: std.mem.Allocator, prompt: []const u8, callback: ?PromptCallback) !?[]u8 {
     // Start with a 128-byte buffer, grow dynamically as needed
     var bufsize: usize = 128;
     var buf = try allocator.alloc(u8, bufsize);
@@ -954,6 +986,7 @@ fn editorPrompt(allocator: std.mem.Allocator, prompt: []const u8) !?[]u8 {
         }
         else if (c=='\x1b'){
             editorSetStatusMessage("", .{});
+            if (callback) |cb| cb(buf[0..buflen], c);
             allocator.free(buf);
             return null;
         }
@@ -961,7 +994,7 @@ fn editorPrompt(allocator: std.mem.Allocator, prompt: []const u8) !?[]u8 {
             // Enter pressed: return buffer if non-empty
             if (buflen != 0) {
                 editorSetStatusMessage("", .{});
-                // Shrink to exact size before returning (optional but tidy)
+                if (callback) |cb| cb(buf[0..buflen], c);
                 const exact = try allocator.realloc(buf, buflen + 1);
                 return exact;
             }
@@ -977,7 +1010,7 @@ fn editorPrompt(allocator: std.mem.Allocator, prompt: []const u8) !?[]u8 {
             buflen += 1;
             buf[buflen] = 0; // maintain null terminator
         }
-        // All other keys (arrows, escape, etc.) are ignored
+        if (callback) |cb| cb(buf[0..buflen], c);
     }
 }
 
