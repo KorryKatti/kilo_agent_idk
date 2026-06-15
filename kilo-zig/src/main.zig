@@ -50,7 +50,15 @@ const erow = struct {
     size: c_int,
     rsize: c_int,
     render: []u8,
+    hl:[]u8,
 };
+
+const editorHighlight = enum(c_int) {
+    HL_NORMAL = 0,
+    HL_NUMBER,
+    HL_MATCH,
+};
+
 
 const EditorConfig = struct {
     cx: c_int = 0,
@@ -164,6 +172,7 @@ fn editorUpdateRow(allocator: std.mem.Allocator, row: *erow) !void {
     }
     // match final index count to row rendered ssize
     row.rsize = @intCast(idx);
+    try editorUpdateSyntax(allocator, row);
 }
 
 // insert single character into row at given position
@@ -270,6 +279,9 @@ fn editorFreeRow(allocator: std.mem.Allocator, row: *erow) void {
 
     // Free the raw character buffer
     allocator.free(row.chars);
+
+    // free the hl thing half life
+    allocator.free(row.hl);
 }
 
 /// Deletes an entire row from the editor, shifting all rows below it up.
@@ -400,6 +412,7 @@ fn editorInsertRow(allocator: std.mem.Allocator, at: c_int, s: []const u8) !void
         .chars = chars,
         .rsize = 0,
         .render = &[_]u8{},
+        .hl = &[_]u8{},
     };
 
     // Build the rendered version
@@ -451,6 +464,45 @@ fn getWindowSize(rows: *c_int, cols: *c_int) !c_int {
         cols.* = ws.col;
         rows.* = ws.row;
         return 0;
+    }
+}
+
+// syntax hihglitings
+fn isSeparator(c: u8) bool {
+    return std.ascii.isWhitespace(c) or c == 0 or std.mem.indexOfScalar(u8, ",.()+-/*=~%<>[];", c) != null;
+}
+
+fn editorUpdateSyntax(allocator:std.mem.Allocator,row:*erow) !void{
+    row.hl = try allocator.realloc(row.hl, @intCast(row.rsize));
+    @memset(row.hl[0..@as(usize, @intCast(row.rsize))], @intFromEnum(editorHighlight.HL_NORMAL));
+
+    var prev_sep: bool = true;
+    var i:c_int = 0;
+    while (i<row.rsize) : (i+=1){
+        const c = row.render[@intCast(i)];
+        const prev_hl: u8 = if (i > 0) row.hl[@intCast(i - 1)] else @intFromEnum(editorHighlight.HL_NORMAL);
+
+        if (std.ascii.isDigit(c) and (prev_sep or prev_hl == @intFromEnum(editorHighlight.HL_NUMBER)) or
+            (c == '.' and prev_hl == @intFromEnum(editorHighlight.HL_NUMBER))
+        ) {
+            row.hl[@intCast(i)] = @intFromEnum(editorHighlight.HL_NUMBER);
+            prev_sep = false;
+            continue;
+        }
+
+        prev_sep = isSeparator(c);
+    }
+}
+
+fn editorSyntaxToColor(hl:c_int) c_int{
+    switch(hl){
+        @intFromEnum(editorHighlight.HL_NUMBER)=>{
+            return 31;
+        },
+        @intFromEnum(editorHighlight.HL_MATCH)=>{
+            return 34;
+        },
+        else => {return 37;},
     }
 }
 
@@ -535,8 +587,18 @@ fn editorSave(allocator: std.mem.Allocator) !void {
 // moves cursor to the first match. esc cancels the prompt
 var find_last_match: c_int = -1;
 var find_direction: c_int = 1;
+var saved_hl_line: c_int = -1;
+var saved_hl: ?[]u8 = null;
 
 fn editorFindCallback(query: []const u8, key: c_int) void {
+    // Restore previous highlight if any
+    if (saved_hl) |hl_data| {
+        const line_idx = @as(usize, @intCast(saved_hl_line));
+        @memcpy(E.row[line_idx].hl[0..hl_data.len], hl_data);
+        allocator_free(hl_data);
+        saved_hl = null;
+    }
+
     if (key == '\r' or key == '\x1b') {
         find_last_match = -1;
         find_direction = 1;
@@ -572,6 +634,15 @@ fn editorFindCallback(query: []const u8, key: c_int) void {
             E.cy = current;
             E.cx = editorRowRxToCx(row, @as(c_int, @intCast(match_index)));
             E.rowoff = E.numrows;
+
+            // Save current hl and highlight the match
+            saved_hl_line = current;
+            const rsize = @as(usize, @intCast(row.rsize));
+            var saved = gpa_allocator.alloc(u8, rsize) catch break;
+            @memcpy(saved[0..rsize], row.hl[0..rsize]);
+            saved_hl = saved;
+
+            @memset(row.hl[match_index .. match_index + query.len], @intFromEnum(editorHighlight.HL_MATCH));
             break;
         }
     }
@@ -626,6 +697,11 @@ fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
 // struct editorConfig E;
 
 var E: EditorConfig = .{ .orig_termios = undefined };
+var gpa_allocator: std.mem.Allocator = undefined;
+
+fn allocator_free(ptr: []u8) void {
+    gpa_allocator.free(ptr);
+}
 
 fn initEditor() !void {
     E.cx = 0;
@@ -1082,14 +1158,11 @@ fn editorScroll() !void {
 fn editorDrawRows(allocator: std.mem.Allocator, ab: *abuf) !void {
     var y: c_int = 0;
 
-    // Loop through every single row row on the screen
     while (y < E.screenrows) : (y += 1) {
-        // Calculate the actual row index of the file we are currently rendering
         const filerow: c_int = y + E.rowoff;
 
-        // CASE 1: We are drawing BEYOND the text lines currently loaded in the file
         if (filerow >= E.numrows) {
-            // Display the welcome message only if no file rows are loaded at all
+            // Welcome message or tilde
             if (E.numrows == 0 and y == @divTrunc(E.screenrows, 3)) {
                 var welcome: [80]u8 = undefined;
                 const res = try std.fmt.bufPrint(&welcome, "Kilo editor -- version {s}", .{KILO_VERSION});
@@ -1109,39 +1182,49 @@ fn editorDrawRows(allocator: std.mem.Allocator, ab: *abuf) !void {
 
                 try abAppend(allocator, ab, res[0..@as(usize, @intCast(welcomelen))]);
             } else {
-                // Regular trailing line outside the file content gets a tilde
                 try abAppend(allocator, ab, "~");
             }
         } else {
+            // Actual file content with syntax highlighting
             const current_row = E.row[@as(usize, @intCast(filerow))];
 
+            var len = current_row.rsize - E.coloff;
+            if (len < 0) len = 0;
+            if (len > E.screencols) len = E.screencols;
+
             const u_coloff = @as(usize, @intCast(E.coloff));
+            const c = current_row.render[u_coloff..];
+            const hl = current_row.hl[u_coloff..];
 
-            var len: usize = 0;
+            var current_color: c_int = -1;
+            var j: c_int = 0;
+            while (j < len) : (j += 1) {
+                const idx = @as(usize, @intCast(j));
 
-            const u_rsize = @as(usize, @intCast(current_row.size));
-
-            if (u_rsize > u_coloff) {
-                len = u_rsize - u_coloff;
+                if (hl[idx] == @intFromEnum(editorHighlight.HL_NORMAL)) {
+                    if (current_color != -1) {
+                        try abAppend(allocator, ab, "\x1b[39m");
+                        current_color = -1;
+                    }
+                    try abAppend(allocator, ab, c[idx..idx + 1]);
+                } else {
+                    const color = editorSyntaxToColor(hl[idx]);
+                    if (color != current_color) {
+                        current_color = color;
+                        var buf: [16]u8 = undefined;
+                        const clen = try std.fmt.bufPrint(&buf, "\x1b[{d}m", .{color});
+                        try abAppend(allocator, ab, clen);
+                    }
+                    try abAppend(allocator, ab, c[idx..idx + 1]);
+                }
             }
 
-            if (len > @as(usize, @intCast(E.screencols))) {
-                len = @as(usize, @intCast(E.screencols));
-            }
-
-            if (len > 0) {
-                const end = u_coloff + len;
-                try abAppend(allocator, ab, current_row.render[u_coloff..end]);
-            }
+            // Reset color to default at end of line
+            try abAppend(allocator, ab, "\x1b[39m");
         }
 
-        // Clear the remainder of the current line from the cursor to the right margin
         try abAppend(allocator, ab, "\x1b[K");
-
-        // Append a newline carriage return for every row except the absolute last line
-        // if (y < E.screenrows - 1) {
         try abAppend(allocator, ab, "\r\n");
-        // }
     }
 }
 
@@ -1208,6 +1291,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    gpa_allocator = allocator;
 
     // Enter raw mode first so we control the terminal completely
     _ = try enableRawMode();
