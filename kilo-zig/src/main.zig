@@ -93,6 +93,7 @@ const erow = struct {
 
 const editorHighlight = enum(c_int) {
     HL_NORMAL = 0,
+    HL_NONPRINT = 1,
     HL_COMMENT,
     HL_MLCOMMENT,
     HL_KEYWORD1,
@@ -201,11 +202,11 @@ fn editorUpdateRow(allocator: std.mem.Allocator, row: *erow) !void {
 
     // fill the new buffer and pad tabs out to trab stops
     var idx: usize = 0;
-    for (row.chars) |c| {
+    for (row.chars[0..@as(usize, @intCast(row.size))]) |c| {
         if (c == '\t') {
             row.render[idx] = ' ';
             idx += 1;
-            while (idx % tab_size != 0) : (idx += 1) {
+            while ((idx + 1) % tab_size != 0) : (idx += 1) {
                 row.render[idx] = ' ';
             }
         } else {
@@ -224,7 +225,15 @@ fn editorRowInsertChar(allocator: std.mem.Allocator, row: *erow, at: c_int, c: u
     // clamp insertion point to validate range
     var insert_pos = at;
     if (insert_pos < 0 or insert_pos > row.size) {
-        insert_pos = row.size;
+        // Pad with spaces if inserting far past end
+        const padlen = @as(usize, @intCast(insert_pos - row.size));
+        const current_size = @as(usize, @intCast(row.size));
+        const new_chars = try allocator.realloc(row.chars, current_size + padlen + 2);
+        @memset(new_chars[current_size .. current_size + padlen], ' ');
+        new_chars[current_size + padlen + 1] = 0;
+        row.chars = new_chars;
+        row.size += @as(c_int, @intCast(padlen)) + 1;
+        insert_pos = row.size - 1;
     }
 
     const pos = @as(usize, @intCast(insert_pos));
@@ -279,8 +288,13 @@ fn editorInsertNewline(allocator: std.mem.Allocator) !void {
     }
 
     // Move cursor to the start of the newly created line
-    E.cy += 1;
+    if (E.cy == E.screenrows - 1) {
+        E.rowoff += 1;
+    } else {
+        E.cy += 1;
+    }
     E.cx = 0;
+    E.coloff = 0;
 }
 
 // simple backspaces
@@ -381,12 +395,26 @@ fn editorDelChar(allocator: std.mem.Allocator) !void {
         editorRowDelChar(allocator, row, E.cx - 1);
 
         // Move cursor left to fill the gap
-        E.cx -= 1;
+        if (E.cx == 0 and E.coloff > 0) {
+            E.coloff -= 1;
+        } else {
+            E.cx -= 1;
+        }
     } else {
-        E.cx = E.row[@intCast(E.cy - 1)].size;
+        const filecol = E.row[@intCast(E.cy - 1)].size;
         try editorRowAppendString(allocator, &E.row[@intCast(E.cy - 1)], row.chars);
         editorDelRow(allocator, E.cy);
-        E.cy -= 1;
+        if (E.cy == 0) {
+            E.rowoff -= 1;
+        } else {
+            E.cy -= 1;
+        }
+        E.cx = filecol;
+        if (E.cx >= E.screencols) {
+            const shift = (E.screencols - E.cx) + 1;
+            E.cx -= shift;
+            E.coloff += shift;
+        }
     }
 }
 
@@ -426,7 +454,11 @@ fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
     try editorRowInsertChar(allocator, &E.row[row_index], E.cx, c);
 
     // advance cursor one column to right
-    E.cx += 1;
+    if (E.cx == E.screencols - 1) {
+        E.coloff += 1;
+    } else {
+        E.cx += 1;
+    }
 }
 
 /// Inserts a new row at position `at` with the given string content.
@@ -512,13 +544,24 @@ fn getWindowSize(rows: *c_int, cols: *c_int) !c_int {
 
     // 1. Check if ioctl failed or returned an empty column width
     if (posix.errno(rc) != .SUCCESS or ws.col == 0) {
+        // Save original cursor position
+        var orig_row: c_int = 0;
+        var orig_col: c_int = 0;
+        _ = getCursorPosition(&orig_row, &orig_col) catch 0;
 
         // 2. Fallback: Push cursor to the bottom-right corner
         const written = posix.write(posix.STDOUT_FILENO, "\x1b[999C\x1b[999B") catch return -1;
         if (written != 12) return -1;
 
         // 3. Ask the terminal where the cursor is and return that instead
-        return getCursorPosition(rows, cols);
+        const result = getCursorPosition(rows, cols);
+
+        // Restore original cursor position
+        var buf: [32]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ orig_row, orig_col }) catch return -1;
+        _ = posix.write(posix.STDOUT_FILENO, msg) catch {};
+
+        return result;
     } else {
         // 4. Success: Use the values directly from the ioctl struct
         cols.* = ws.col;
@@ -529,7 +572,7 @@ fn getWindowSize(rows: *c_int, cols: *c_int) !c_int {
 
 // syntax hihglitings
 fn isSeparator(c: u8) bool {
-    return std.ascii.isWhitespace(c) or c == 0 or std.mem.indexOfScalar(u8, ",.()+-/*=~%<>[];", c) != null;
+    return std.ascii.isWhitespace(c) or c == 0 or std.mem.indexOfScalar(u8, ",.()+-/*=~%[];", c) != null;
 }
 
 fn editorUpdateSyntax(allocator: std.mem.Allocator, row: *erow) !void {
@@ -548,13 +591,16 @@ fn editorUpdateSyntax(allocator: std.mem.Allocator, row: *erow) !void {
     var in_string: u8 = 0;
     var in_comment: bool = if (row.idx > 0) E.row[@intCast(row.idx - 1)].hl_open_comment != 0 else false;
     var i: c_int = 0;
+    while (i < row.rsize) : (i += 1) {
+        if (!std.ascii.isWhitespace(row.render[@intCast(i)])) break;
+    }
     while (i < row.rsize) {
         const c = row.render[@intCast(i)];
         const prev_hl: u8 = if (i > 0) row.hl[@intCast(i - 1)] else @intFromEnum(editorHighlight.HL_NORMAL);
 
         if (E.syntax) |syntax| {
             // Single-line comments (not inside strings or multi-line comments)
-            if (scs_len > 0 and in_string == 0 and !in_comment) {
+            if (prev_sep and scs_len > 0 and in_string == 0 and !in_comment) {
                 const u_i = @as(usize, @intCast(i));
                 if (u_i + scs_len <= row.render.len) {
                     if (std.mem.eql(u8, row.render[u_i .. u_i + scs_len], scs)) {
@@ -578,6 +624,7 @@ fn editorUpdateSyntax(allocator: std.mem.Allocator, row: *erow) !void {
                             continue;
                         }
                     }
+                    prev_sep = false;
                     i += 1;
                     continue;
                 } else {
@@ -603,7 +650,7 @@ fn editorUpdateSyntax(allocator: std.mem.Allocator, row: *erow) !void {
                     }
                     if (c == in_string) in_string = 0;
                     i += 1;
-                    prev_sep = true;
+                    prev_sep = false;
                     continue;
                 } else {
                     if (c == '"' or c == '\'') {
@@ -659,8 +706,8 @@ fn editorUpdateSyntax(allocator: std.mem.Allocator, row: *erow) !void {
         i += 1;
     }
 
-    const changed = (row.hl_open_comment != @intFromBool(in_comment));
-    row.hl_open_comment = @intFromBool(in_comment);
+    const changed = (row.hl_open_comment != (if (in_comment) @as(c_int, 1) else @as(c_int, 0)));
+    row.hl_open_comment = if (in_comment) @as(c_int, 1) else @as(c_int, 0);
     if (changed and row.idx + 1 < E.numrows) {
         try editorUpdateSyntax(allocator, &E.row[@intCast(row.idx + 1)]);
     }
@@ -862,7 +909,7 @@ fn editorFindCallback(query: []const u8, key: c_int) void {
             find_last_match = current;
             E.cy = current;
             E.cx = editorRowRxToCx(row, @as(c_int, @intCast(match_index)));
-            E.rowoff = E.numrows;
+            E.rowoff = current;
 
             // Save current hl and highlight the match
             saved_hl_line = current;
@@ -900,10 +947,10 @@ fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
         allocator.free(old_name);
     }
 
-    try editorSelectSyntaxHighlight(allocator);
-
     // Duplicate new filename into owned memory
     E.filename = try allocator.dupe(u8, filename);
+
+    try editorSelectSyntaxHighlight(allocator);
 
     var lines = try readit.readLines(allocator, filename);
     defer lines.deinit();
@@ -1066,10 +1113,7 @@ fn editorProcessKeypress() !void {
 
     switch (c) {
         '\r' => {
-            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-            defer _ = gpa.deinit();
-            const allocator = gpa.allocator();
-            try editorInsertNewline(allocator);
+            try editorInsertNewline(gpa_allocator);
         },
         ctrlKey('x') => {
             if (E.dirty > 0 and quit_times > 0) {
@@ -1084,10 +1128,7 @@ fn editorProcessKeypress() !void {
         },
 
         ctrlKey('s') => {
-            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-            defer _ = gpa.deinit();
-            const allocator = gpa.allocator();
-            try editorSave(allocator);
+            try editorSave(gpa_allocator);
         },
 
         @intFromEnum(editorKey.HOME_KEY) => E.cx = 0,
@@ -1099,31 +1140,18 @@ fn editorProcessKeypress() !void {
         },
 
         ctrlKey('f') => {
-            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-            defer _ = gpa.deinit();
-            const allocator = gpa.allocator();
-            try editorFind(allocator);
+            try editorFind(gpa_allocator);
         },
 
         @intFromEnum(editorKey.BACKSPACE), ctrlKey('h'), @intFromEnum(editorKey.DEL_KEY) => {
-            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-            defer _ = gpa.deinit();
-            const allocator = gpa.allocator();
-            if (c == @intFromEnum(editorKey.DEL_KEY)) {
-                editorMoveCursor(@intFromEnum(editorKey.ARROW_RIGHT));
-            }
-
-            try editorDelChar(allocator);
+            try editorDelChar(gpa_allocator);
         },
 
         @intFromEnum(editorKey.PAGE_UP), @intFromEnum(editorKey.PAGE_DOWN) => {
-            if (c == @intFromEnum(editorKey.PAGE_UP)) {
-                E.cy = E.rowoff;
-            } else {
-                E.cy = E.rowoff + E.screenrows - 1;
-                if (E.cy > E.numrows) {
-                    E.cy = E.numrows;
-                }
+            if (c == @intFromEnum(editorKey.PAGE_UP) and E.cy != 0) {
+                E.cy = 0;
+            } else if (c == @intFromEnum(editorKey.PAGE_DOWN) and E.cy != E.screenrows - 1) {
+                E.cy = E.screenrows - 1;
             }
 
             var times = E.screenrows;
@@ -1144,10 +1172,7 @@ fn editorProcessKeypress() !void {
         '\x1b', ctrlKey('l') => {},
 
         else => {
-            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-            defer _ = gpa.deinit();
-            const allocator = gpa.allocator();
-            try editorInsertChar(allocator, @intCast(c));
+            try editorInsertChar(gpa_allocator, @intCast(c));
         },
     }
     quit_times = KILO_QUIT_TIMES;
@@ -1205,7 +1230,7 @@ fn editorDrawStatusBar(allocator: std.mem.Allocator, ab: *abuf) !void {
 
     const rformatted = try std.fmt.bufPrint(&rstatus, "{s} | {d}/{d}", .{
         filetype,
-        E.cy + 1,
+        E.rowoff + E.cy + 1,
         E.numrows,
     });
     const rlen = @as(c_int, @intCast(rformatted.len));
@@ -1331,42 +1356,65 @@ fn editorMoveCursor(key: c_int) void {
         @intFromEnum(editorKey.ARROW_LEFT) => {
             if (E.cx != 0) {
                 E.cx -= 1;
+            } else if (E.coloff > 0) {
+                E.coloff -= 1;
             } else if (E.cy > 0) {
-                // 1. Move up to the previous line
-                E.cy = E.cy - 1;
-
-                const target_row_index = @as(usize, @intCast(E.cy));
-                const previous_row = E.row[target_row_index];
-
-                E.cx = @as(c_int, @intCast(previous_row.chars.len));
+                E.cy -= 1;
+                E.cx = E.row[@intCast(E.cy)].size;
+                if (E.cx > E.screencols - 1) {
+                    E.coloff = E.cx - E.screencols + 1;
+                    E.cx = E.screencols - 1;
+                }
             }
         },
         @intFromEnum(editorKey.ARROW_RIGHT) => {
             if (row) |r| {
-                if (E.cx < r.chars.len) {
-                    E.cx += 1;
-                }
-            } else if (row) |r| {
-                const row_len = @as(c_int, @intCast(r.chars.len));
-
-                if (E.cx == row_len) {
-                    E.cy += 1;
+                if (E.cx < r.size) {
+                    if (E.cx == E.screencols - 1) {
+                        E.coloff += 1;
+                    } else {
+                        E.cx += 1;
+                    }
+                } else if (E.cx == r.size) {
                     E.cx = 0;
+                    E.coloff = 0;
+                    if (E.cy == E.screenrows - 1) {
+                        E.rowoff += 1;
+                    } else {
+                        E.cy += 1;
+                    }
                 }
             }
         },
         @intFromEnum(editorKey.ARROW_UP) => {
-            if (E.cy != 0) E.cy -= 1;
+            if (E.cy == 0) {
+                if (E.rowoff > 0) E.rowoff -= 1;
+            } else {
+                E.cy -= 1;
+            }
         },
         @intFromEnum(editorKey.ARROW_DOWN) => {
-            if (E.cy < E.numrows) E.cy += 1;
+            if (E.cy < E.numrows) {
+                if (E.cy == E.screenrows - 1) {
+                    E.rowoff += 1;
+                } else {
+                    E.cy += 1;
+                }
+            }
         },
         else => {},
     }
-    const rowlen = if (row) |r| r.chars.len else 0;
 
-    if (E.cx > @as(c_int, @intCast(rowlen))) {
-        E.cx = @as(c_int, @intCast(rowlen));
+    const filerow = E.rowoff + E.cy;
+    const filecol = E.coloff + E.cx;
+    const r: ?*erow = if (filerow < E.numrows) &E.row[@intCast(filerow)] else null;
+    const rowlen = if (r) |rr| rr.size else 0;
+    if (filecol > rowlen) {
+        E.cx -= filecol - rowlen;
+        if (E.cx < 0) {
+            E.coloff += E.cx;
+            E.cx = 0;
+        }
     }
 }
 
@@ -1399,7 +1447,7 @@ fn editorDrawRows(allocator: std.mem.Allocator, ab: *abuf) !void {
             // Welcome message or tilde
             if (E.numrows == 0 and y == @divTrunc(E.screenrows, 3)) {
                 var welcome: [80]u8 = undefined;
-                const res = try std.fmt.bufPrint(&welcome, "Kilo editor -- version {s}", .{KILO_VERSION});
+                const res = try std.fmt.bufPrint(&welcome, "Kilo editor -- version {s}\x1b[0K\r\n", .{KILO_VERSION});
 
                 var welcomelen = @as(c_int, @intCast(res.len));
                 if (welcomelen > E.screencols) welcomelen = E.screencols;
@@ -1435,7 +1483,17 @@ fn editorDrawRows(allocator: std.mem.Allocator, ab: *abuf) !void {
             while (j < len) : (j += 1) {
                 const idx = @as(usize, @intCast(j));
 
-                if (std.ascii.isControl(c[idx])) {
+                if (hl[idx] == @intFromEnum(editorHighlight.HL_NONPRINT)) {
+                    const sym: u8 = if (c[idx] <= 26) '@' + c[idx] else '?';
+                    try abAppend(allocator, ab, "\x1b[7m");
+                    try abAppend(allocator, ab, &[_]u8{sym});
+                    try abAppend(allocator, ab, "\x1b[m");
+                    if (current_color != -1) {
+                        var buf: [16]u8 = undefined;
+                        const clen = try std.fmt.bufPrint(&buf, "\x1b[{d}m", .{current_color});
+                        try abAppend(allocator, ab, clen);
+                    }
+                } else if (std.ascii.isControl(c[idx])) {
                     const sym: u8 = if (c[idx] <= 26) '@' + c[idx] else '?';
                     try abAppend(allocator, ab, "\x1b[7m");
                     try abAppend(allocator, ab, &[_]u8{sym});
