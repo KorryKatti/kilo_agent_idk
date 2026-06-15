@@ -1,5 +1,7 @@
 # Kilo Agent / Kilo-Zig
 
+My thoughts on writing this : [Blog post](https://korrykatti.github.io/blog/posts/15062026.html)
+
 A personal fork of [Kilo](https://github.com/antirez/kilo) focused on rewriting the editor in Zig and exploring Gleam-based agents.
 
 ### Components
