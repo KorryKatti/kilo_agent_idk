@@ -50,16 +50,30 @@ pub const HL_HIGHLIGHT_STRINGS = 1 << 1;
 const EditorSyntax = struct {
     filetype: []const u8,
     filematch: []const []const u8,
+    keywords: []const []const u8,
+    singleline_comment_start: []const u8,
+    multiline_comment_start: []const u8,
+    multiline_comment_end: []const u8,
     flags: c_int,
 };
 
 const C_HL_extensions = [_][]const u8{ ".c", ".h", ".cpp" };
+const C_HL_keywords = [_][]const u8{
+    "switch",    "if",     "while",  "for",    "break",  "continue", "return", "else",
+    "struct",    "union",  "typedef","static", "enum",   "class",    "case",
+    "int|",      "long|",  "double|","float|", "char|",  "unsigned|","signed|",
+    "void|",
+};
 
 // syntax databae
 const HLDB = [_]EditorSyntax{
     .{
         .filetype = "c",
         .filematch = &C_HL_extensions,
+        .keywords = &C_HL_keywords,
+        .singleline_comment_start = "//",
+        .multiline_comment_start = "/*",
+        .multiline_comment_end = "*/",
         .flags = HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
     },
 };
@@ -68,16 +82,22 @@ const HLDB = [_]EditorSyntax{
 pub const HLDB_ENTRIES = HLDB.len;
 
 const erow = struct {
+    idx: c_int,
     chars: []u8,
     size: c_int,
     rsize: c_int,
     render: []u8,
     hl: []u8,
+    hl_open_comment: c_int,
 };
 
 const editorHighlight = enum(c_int) {
     HL_NORMAL = 0,
-    HL_STRING, // oh hl means highlight
+    HL_COMMENT,
+    HL_MLCOMMENT,
+    HL_KEYWORD1,
+    HL_KEYWORD2,
+    HL_STRING,
     HL_NUMBER,
     HL_MATCH,
 };
@@ -330,6 +350,12 @@ fn editorDelRow(allocator: std.mem.Allocator, at: c_int) void {
     const new_rows = allocator.realloc(E.row, numrows - 1) catch E.row[0 .. numrows - 1];
     E.row = new_rows;
 
+    // Update idx of displaced rows
+    var j: usize = pos;
+    while (j < numrows - 1) : (j += 1) {
+        E.row[j].idx -= 1;
+    }
+
     // Update editor state
     E.numrows -= 1;
     E.dirty += 1;
@@ -424,6 +450,12 @@ fn editorInsertRow(allocator: std.mem.Allocator, at: c_int, s: []const u8) !void
     const dst = E.row[pos + 1 .. numrows + 1];
     std.mem.copyBackwards(erow, dst, src);
 
+    // Update idx of displaced rows
+    var j: usize = pos + 1;
+    while (j <= numrows) : (j += 1) {
+        E.row[j].idx += 1;
+    }
+
     // Allocate and copy the character content for the new row
     const chars = try allocator.alloc(u8, s.len + 1);
     @memcpy(chars[0..s.len], s);
@@ -431,11 +463,13 @@ fn editorInsertRow(allocator: std.mem.Allocator, at: c_int, s: []const u8) !void
 
     // Initialize the new row in the opened slot
     E.row[pos] = erow{
+        .idx = @intCast(at),
         .size = @as(c_int, @intCast(s.len)),
         .chars = chars,
         .rsize = 0,
         .render = &[_]u8{},
         .hl = &[_]u8{},
+        .hl_open_comment = 0,
     };
 
     // Build the rendered version
@@ -456,10 +490,13 @@ fn editorAppendRow(allocator: std.mem.Allocator, s: []const u8) !void {
     const chars_copy = try allocator.dupe(u8, s);
 
     E.row[at] = erow{
+        .idx = @intCast(at),
         .size = @as(c_int, @intCast(s.len)),
         .chars = chars_copy,
         .rsize = 0,
-        .render = &[_]u8{}, //
+        .render = &[_]u8{},
+        .hl = &[_]u8{},
+        .hl_open_comment = 0,
     };
 
     try editorUpdateRow(allocator, &E.row[at]);
@@ -501,14 +538,61 @@ fn editorUpdateSyntax(allocator: std.mem.Allocator, row: *erow) !void {
 
     if (E.syntax == null) return;
 
+    const scs = E.syntax.?.singleline_comment_start;
+    const scs_len: usize = scs.len;
+    const mcs = E.syntax.?.multiline_comment_start;
+    const mcs_len: usize = mcs.len;
+    const mce = E.syntax.?.multiline_comment_end;
+    const mce_len: usize = mce.len;
     var prev_sep: bool = true;
     var in_string: u8 = 0;
+    var in_comment: bool = if (row.idx > 0) E.row[@intCast(row.idx - 1)].hl_open_comment != 0 else false;
     var i: c_int = 0;
     while (i < row.rsize) {
         const c = row.render[@intCast(i)];
         const prev_hl: u8 = if (i > 0) row.hl[@intCast(i - 1)] else @intFromEnum(editorHighlight.HL_NORMAL);
 
         if (E.syntax) |syntax| {
+            // Single-line comments (not inside strings or multi-line comments)
+            if (scs_len > 0 and in_string == 0 and !in_comment) {
+                const u_i = @as(usize, @intCast(i));
+                if (u_i + scs_len <= row.render.len) {
+                    if (std.mem.eql(u8, row.render[u_i .. u_i + scs_len], scs)) {
+                        @memset(row.hl[u_i..@as(usize, @intCast(row.rsize))], @intFromEnum(editorHighlight.HL_COMMENT));
+                        break;
+                    }
+                }
+            }
+
+            // Multi-line comments (not inside strings)
+            if (mcs_len > 0 and mce_len > 0 and in_string == 0) {
+                if (in_comment) {
+                    row.hl[@intCast(i)] = @intFromEnum(editorHighlight.HL_MLCOMMENT);
+                    const u_i = @as(usize, @intCast(i));
+                    if (u_i + mce_len <= row.render.len) {
+                        if (std.mem.eql(u8, row.render[u_i .. u_i + mce_len], mce)) {
+                            @memset(row.hl[u_i .. u_i + mce_len], @intFromEnum(editorHighlight.HL_MLCOMMENT));
+                            i += @intCast(mce_len);
+                            in_comment = false;
+                            prev_sep = true;
+                            continue;
+                        }
+                    }
+                    i += 1;
+                    continue;
+                } else {
+                    const u_i = @as(usize, @intCast(i));
+                    if (u_i + mcs_len <= row.render.len) {
+                        if (std.mem.eql(u8, row.render[u_i .. u_i + mcs_len], mcs)) {
+                            @memset(row.hl[u_i .. u_i + mcs_len], @intFromEnum(editorHighlight.HL_MLCOMMENT));
+                            i += @intCast(mcs_len);
+                            in_comment = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+
             if (syntax.flags & HL_HIGHLIGHT_STRINGS != 0) {
                 if (in_string != 0) {
                     row.hl[@intCast(i)] = @intFromEnum(editorHighlight.HL_STRING);
@@ -541,16 +625,61 @@ fn editorUpdateSyntax(allocator: std.mem.Allocator, row: *erow) !void {
                     continue;
                 }
             }
+
+            // Keywords
+            if (prev_sep) {
+                var found_keyword = false;
+                for (syntax.keywords) |kw| {
+                    const klen: c_int = @intCast(kw.len);
+                    const kw2 = kw[@intCast(klen - 1)] == '|';
+                    const actual_len = if (kw2) klen - 1 else klen;
+                    const u_i = @as(usize, @intCast(i));
+
+                    if (u_i + @as(usize, @intCast(actual_len)) <= row.render.len) {
+                        if (std.mem.eql(u8, row.render[u_i .. u_i + @as(usize, @intCast(actual_len))], kw[0..@as(usize, @intCast(actual_len))])) {
+                            const next_pos = i + actual_len;
+                            if (next_pos >= row.rsize or isSeparator(row.render[@intCast(next_pos)])) {
+                                const hl_type: u8 = if (kw2) @intFromEnum(editorHighlight.HL_KEYWORD2) else @intFromEnum(editorHighlight.HL_KEYWORD1);
+                                @memset(row.hl[u_i .. u_i + @as(usize, @intCast(actual_len))], hl_type);
+                                i += actual_len;
+                                found_keyword = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (found_keyword) {
+                    prev_sep = false;
+                    continue;
+                }
+            }
         }
 
         prev_sep = isSeparator(c);
         i += 1;
     }
+
+    const changed = (row.hl_open_comment != @intFromBool(in_comment));
+    row.hl_open_comment = @intFromBool(in_comment);
+    if (changed and row.idx + 1 < E.numrows) {
+        try editorUpdateSyntax(allocator, &E.row[@intCast(row.idx + 1)]);
+    }
 }
 
 fn editorSyntaxToColor(hl: c_int) c_int {
     switch (hl) {
-        @intFromEnum(editorHighlight.HL_STRING)=>{return 35;},
+        @intFromEnum(editorHighlight.HL_COMMENT), @intFromEnum(editorHighlight.HL_MLCOMMENT) => {
+            return 36;
+        },
+        @intFromEnum(editorHighlight.HL_KEYWORD1) => {
+            return 33;
+        },
+        @intFromEnum(editorHighlight.HL_KEYWORD2) => {
+            return 32;
+        },
+        @intFromEnum(editorHighlight.HL_STRING) => {
+            return 35;
+        },
         @intFromEnum(editorHighlight.HL_NUMBER) => {
             return 31;
         },
@@ -1306,7 +1435,17 @@ fn editorDrawRows(allocator: std.mem.Allocator, ab: *abuf) !void {
             while (j < len) : (j += 1) {
                 const idx = @as(usize, @intCast(j));
 
-                if (hl[idx] == @intFromEnum(editorHighlight.HL_NORMAL)) {
+                if (std.ascii.isControl(c[idx])) {
+                    const sym: u8 = if (c[idx] <= 26) '@' + c[idx] else '?';
+                    try abAppend(allocator, ab, "\x1b[7m");
+                    try abAppend(allocator, ab, &[_]u8{sym});
+                    try abAppend(allocator, ab, "\x1b[m");
+                    if (current_color != -1) {
+                        var buf: [16]u8 = undefined;
+                        const clen = try std.fmt.bufPrint(&buf, "\x1b[{d}m", .{current_color});
+                        try abAppend(allocator, ab, clen);
+                    }
+                } else if (hl[idx] == @intFromEnum(editorHighlight.HL_NORMAL)) {
                     if (current_color != -1) {
                         try abAppend(allocator, ab, "\x1b[39m");
                         current_color = -1;
