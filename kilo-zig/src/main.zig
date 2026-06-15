@@ -44,21 +44,43 @@ const readit = @import("readit.zig"); // made this last year , finally came in u
 pub const KILO_VERSION = "0.0.1";
 pub const KILO_TAB_STOP: c_int = 8;
 pub const KILO_QUIT_TIMES: c_int = 3;
+pub const HL_HIGHLIGHT_NUMBERS = 1 << 0;
+pub const HL_HIGHLIGHT_STRINGS = 1 << 1;
+
+const EditorSyntax = struct {
+    filetype: []const u8,
+    filematch: []const []const u8,
+    flags: c_int,
+};
+
+const C_HL_extensions = [_][]const u8{ ".c", ".h", ".cpp" };
+
+// syntax databae
+const HLDB = [_]EditorSyntax{
+    .{
+        .filetype = "c",
+        .filematch = &C_HL_extensions,
+        .flags = HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
+    },
+};
+
+
+pub const HLDB_ENTRIES = HLDB.len;
 
 const erow = struct {
     chars: []u8,
     size: c_int,
     rsize: c_int,
     render: []u8,
-    hl:[]u8,
+    hl: []u8,
 };
 
 const editorHighlight = enum(c_int) {
     HL_NORMAL = 0,
+    HL_STRING, // oh hl means highlight
     HL_NUMBER,
     HL_MATCH,
 };
-
 
 const EditorConfig = struct {
     cx: c_int = 0,
@@ -74,6 +96,7 @@ const EditorConfig = struct {
     row: []erow = &[_]erow{}, // an empty slice to start with
     statusmsg: [80]u8 = [_]u8{0} ** 80,
     statusmsg_time: i64 = 0,
+    syntax: ?*const EditorSyntax = null, // NEW: pointer to current file's syntax rules
     orig_termios: posix.termios,
 };
 
@@ -472,39 +495,114 @@ fn isSeparator(c: u8) bool {
     return std.ascii.isWhitespace(c) or c == 0 or std.mem.indexOfScalar(u8, ",.()+-/*=~%<>[];", c) != null;
 }
 
-fn editorUpdateSyntax(allocator:std.mem.Allocator,row:*erow) !void{
+fn editorUpdateSyntax(allocator: std.mem.Allocator, row: *erow) !void {
     row.hl = try allocator.realloc(row.hl, @intCast(row.rsize));
     @memset(row.hl[0..@as(usize, @intCast(row.rsize))], @intFromEnum(editorHighlight.HL_NORMAL));
 
+    if (E.syntax == null) return;
+
     var prev_sep: bool = true;
-    var i:c_int = 0;
-    while (i<row.rsize) : (i+=1){
+    var in_string: u8 = 0;
+    var i: c_int = 0;
+    while (i < row.rsize) {
         const c = row.render[@intCast(i)];
         const prev_hl: u8 = if (i > 0) row.hl[@intCast(i - 1)] else @intFromEnum(editorHighlight.HL_NORMAL);
 
-        if (std.ascii.isDigit(c) and (prev_sep or prev_hl == @intFromEnum(editorHighlight.HL_NUMBER)) or
-            (c == '.' and prev_hl == @intFromEnum(editorHighlight.HL_NUMBER))
-        ) {
-            row.hl[@intCast(i)] = @intFromEnum(editorHighlight.HL_NUMBER);
-            prev_sep = false;
-            continue;
+        if (E.syntax) |syntax| {
+            if (syntax.flags & HL_HIGHLIGHT_STRINGS != 0) {
+                if (in_string != 0) {
+                    row.hl[@intCast(i)] = @intFromEnum(editorHighlight.HL_STRING);
+                    if (c == '\\' and i + 1 < row.rsize) {
+                        row.hl[@intCast(i + 1)] = @intFromEnum(editorHighlight.HL_STRING);
+                        i += 2;
+                        continue;
+                    }
+                    if (c == in_string) in_string = 0;
+                    i += 1;
+                    prev_sep = true;
+                    continue;
+                } else {
+                    if (c == '"' or c == '\'') {
+                        in_string = c;
+                        row.hl[@intCast(i)] = @intFromEnum(editorHighlight.HL_STRING);
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+
+            if (syntax.flags & HL_HIGHLIGHT_NUMBERS != 0) {
+                if (std.ascii.isDigit(c) and (prev_sep or prev_hl == @intFromEnum(editorHighlight.HL_NUMBER)) or
+                    (c == '.' and prev_hl == @intFromEnum(editorHighlight.HL_NUMBER)))
+                {
+                    row.hl[@intCast(i)] = @intFromEnum(editorHighlight.HL_NUMBER);
+                    i += 1;
+                    prev_sep = false;
+                    continue;
+                }
+            }
         }
 
         prev_sep = isSeparator(c);
+        i += 1;
     }
 }
 
-fn editorSyntaxToColor(hl:c_int) c_int{
-    switch(hl){
-        @intFromEnum(editorHighlight.HL_NUMBER)=>{
+fn editorSyntaxToColor(hl: c_int) c_int {
+    switch (hl) {
+        @intFromEnum(editorHighlight.HL_STRING)=>{return 35;},
+        @intFromEnum(editorHighlight.HL_NUMBER) => {
             return 31;
         },
-        @intFromEnum(editorHighlight.HL_MATCH)=>{
+        @intFromEnum(editorHighlight.HL_MATCH) => {
             return 34;
         },
-        else => {return 37;},
+        else => {
+            return 37;
+        },
     }
 }
+
+
+/// Scans the syntax database and sets E.syntax based on filename matching.
+/// Supports both extension matching (e.g., ".c") and substring matching.
+fn editorSelectSyntaxHighlight(allocator: std.mem.Allocator) !void {
+    E.syntax = null;
+
+    const filename = E.filename orelse return;
+
+    const ext = std.mem.lastIndexOfScalar(u8, filename, '.');
+
+    var j: usize = 0;
+    while (j < HLDB_ENTRIES) : (j += 1) {
+        const s = &HLDB[j];
+
+        var i: usize = 0;
+        while (i < s.filematch.len) : (i += 1) {
+            const pattern = s.filematch[i];
+
+            const is_ext = pattern.len > 0 and pattern[0] == '.';
+
+            const matched = if (is_ext)
+                if (ext) |e| std.mem.eql(u8, filename[e..], pattern) else false
+            else
+                std.mem.indexOf(u8, filename, pattern) != null;
+
+            if (matched) {
+                E.syntax = s;
+                
+                // Update syntax for all rows with allocator and error handling
+                var filerow: usize = 0;
+                while (filerow < E.numrows) : (filerow += 1) {
+                    try editorUpdateSyntax(allocator, &E.row[filerow]);
+                }
+                return;
+            }
+        }
+    }
+}
+
+
 
 // concetenate all rows into a single string with newline between them
 fn editorRowsToString(allocator: std.mem.Allocator, buflen: *usize) ![]u8 {
@@ -543,11 +641,13 @@ fn editorRowsToString(allocator: std.mem.Allocator, buflen: *usize) ![]u8 {
 
 fn editorSave(allocator: std.mem.Allocator) !void {
     if (E.filename == null) {
-        E.filename = try editorPrompt(allocator,"Save as: %s (ESC t cancel)", null);
-        if (E.filename==null){
+        E.filename = try editorPrompt(allocator, "Save as: %s (ESC t cancel)", null);
+        if (E.filename == null) {
             editorSetStatusMessage("save aborted", .{});
             return;
         }
+        try editorSelectSyntaxHighlight(allocator);
+
     }
 
     const filename = E.filename orelse {
@@ -670,6 +770,9 @@ fn editorOpen(allocator: std.mem.Allocator, filename: []const u8) !void {
     if (E.filename) |old_name| {
         allocator.free(old_name);
     }
+
+    try editorSelectSyntaxHighlight(allocator);
+
     // Duplicate new filename into owned memory
     E.filename = try allocator.dupe(u8, filename);
 
@@ -715,6 +818,7 @@ fn initEditor() !void {
     E.statusmsg[0] = 0;
     E.statusmsg_time = 0;
     E.dirty = 0;
+    E.syntax = null;
 
     // Pass pointers directly, just like C
     if (try getWindowSize(&E.screenrows, &E.screencols) == -1) {
@@ -741,20 +845,20 @@ fn editorRowCxToRx(row: *erow, cx: c_int) c_int {
 // hmm
 // converts a rendered screen column (rx) back to a character index(cx)
 // inverse of editorRowCxToRx . handles tab expansion
-fn editorRowRxToCx(row:*erow,rx:c_int) c_int {
-    var cur_rx:c_int = 0; // current rendered column as we walk
-    var cx: c_int  = 0; // character index we are calcuating
+fn editorRowRxToCx(row: *erow, rx: c_int) c_int {
+    var cur_rx: c_int = 0; // current rendered column as we walk
+    var cx: c_int = 0; // character index we are calcuating
 
     // walk through each raw charactarter , accimumonating rendered columns
-    while (cx<row.size) : (cx+=1){
-        // if this char is a tab  add the padding to reach the next tab stop 
-        if (row.chars[@intCast(cx)]=='\t'){
-            cur_rx+=(KILO_TAB_STOP-1)-@rem(cur_rx,KILO_TAB_STOP);
+    while (cx < row.size) : (cx += 1) {
+        // if this char is a tab  add the padding to reach the next tab stop
+        if (row.chars[@intCast(cx)] == '\t') {
+            cur_rx += (KILO_TAB_STOP - 1) - @rem(cur_rx, KILO_TAB_STOP);
         }
         // every character ( tab or normal ) advances at least 1 rendered column
-        cur_rx+=1;
+        cur_rx += 1;
         // if we passed the target rx , the previous cx was the answer
-        if (cur_rx>rx){
+        if (cur_rx > rx) {
             return cx;
         }
     }
@@ -865,7 +969,7 @@ fn editorProcessKeypress() !void {
             }
         },
 
-        ctrlKey('f')=>{
+        ctrlKey('f') => {
             var gpa = std.heap.GeneralPurposeAllocator(.{}){};
             defer _ = gpa.deinit();
             const allocator = gpa.allocator();
@@ -964,11 +1068,14 @@ fn editorDrawStatusBar(allocator: std.mem.Allocator, ab: *abuf) !void {
 
     try abAppend(allocator, ab, formatted[0..@intCast(len)]);
 
-    // --- Right side: current line / total lines ---
+    // --- Right side: filetype | current line / total lines ---
     var rstatus: [80]u8 = undefined;
 
-    // E.cy is 0-based internally, so add 1 for human-readable display
-    const rformatted = try std.fmt.bufPrint(&rstatus, "{d}/{d}", .{
+    // Unwrap syntax pointer if present, else show "no ft"
+    const filetype = if (E.syntax) |s| s.filetype else "no ft";
+
+    const rformatted = try std.fmt.bufPrint(&rstatus, "{s} | {d}/{d}", .{
+        filetype,
         E.cy + 1,
         E.numrows,
     });
@@ -1055,18 +1162,16 @@ fn editorPrompt(allocator: std.mem.Allocator, prompt: []const u8, callback: ?Pro
 
         const c = try editorReadKey();
 
-        if (c==@intFromEnum(editorKey.DEL_KEY) or c==ctrlKey('h') or c==@intFromEnum(editorKey.BACKSPACE)){
-            if (buflen!=0){
-                buflen-=1;
+        if (c == @intFromEnum(editorKey.DEL_KEY) or c == ctrlKey('h') or c == @intFromEnum(editorKey.BACKSPACE)) {
+            if (buflen != 0) {
+                buflen -= 1;
             }
-        }
-        else if (c=='\x1b'){
+        } else if (c == '\x1b') {
             editorSetStatusMessage("", .{});
             if (callback) |cb| cb(buf[0..buflen], c);
             allocator.free(buf);
             return null;
-        }
-        else if (c == '\r') {
+        } else if (c == '\r') {
             // Enter pressed: return buffer if non-empty
             if (buflen != 0) {
                 editorSetStatusMessage("", .{});
@@ -1206,7 +1311,7 @@ fn editorDrawRows(allocator: std.mem.Allocator, ab: *abuf) !void {
                         try abAppend(allocator, ab, "\x1b[39m");
                         current_color = -1;
                     }
-                    try abAppend(allocator, ab, c[idx..idx + 1]);
+                    try abAppend(allocator, ab, c[idx .. idx + 1]);
                 } else {
                     const color = editorSyntaxToColor(hl[idx]);
                     if (color != current_color) {
@@ -1215,7 +1320,7 @@ fn editorDrawRows(allocator: std.mem.Allocator, ab: *abuf) !void {
                         const clen = try std.fmt.bufPrint(&buf, "\x1b[{d}m", .{color});
                         try abAppend(allocator, ab, clen);
                     }
-                    try abAppend(allocator, ab, c[idx..idx + 1]);
+                    try abAppend(allocator, ab, c[idx .. idx + 1]);
                 }
             }
 
