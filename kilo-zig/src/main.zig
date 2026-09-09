@@ -65,7 +65,7 @@ const C_HL_keywords = [_][]const u8{
     "void|",
 };
 
-// syntax databae
+// syntax database
 const HLDB = [_]EditorSyntax{
     .{
         .filetype = "c",
@@ -200,7 +200,7 @@ fn editorUpdateRow(allocator: std.mem.Allocator, row: *erow) !void {
 
     row.render = try allocator.alloc(u8, row.chars.len + (tabs * (tab_size - 1)));
 
-    // fill the new buffer and pad tabs out to trab stops
+    // fill the new buffer and pad tabs out to tab stops
     var idx: usize = 0;
     for (row.chars[0..@as(usize, @intCast(row.size))]) |c| {
         if (c == '\t') {
@@ -443,7 +443,7 @@ fn editorRowAppendString(allocator: std.mem.Allocator, row: *erow, s: []const u8
 }
 
 // insert character at current cursor positions
-// if cursor on new line past the end of file , create enmpty road first
+    // if cursor on new line past the end of file, create empty row first
 fn editorInsertChar(allocator: std.mem.Allocator, c: u8) !void {
     // if cursor belwo all existing rows , append a new empty row
     if (E.cy == E.numrows) {
@@ -780,7 +780,7 @@ fn editorSelectSyntaxHighlight(allocator: std.mem.Allocator) !void {
 
 
 
-// concetenate all rows into a single string with newline between them
+// concatenate all rows into a single string with newline between them
 fn editorRowsToString(allocator: std.mem.Allocator, buflen: *usize) ![]u8 {
     // calculate total bytes needed
     var totlen: usize = 0;
@@ -790,9 +790,9 @@ fn editorRowsToString(allocator: std.mem.Allocator, buflen: *usize) ![]u8 {
         // each row attributes its size plus 1 byte for '\n'
         totlen += @as(usize, @intCast(E.row[row_index].size)) + 1;
     }
-    // return totla length to caller
+    // return total length to caller
     buflen.* = totlen;
-    // allocates full biuffer in one shot
+    // allocates full buffer in one shot
     var buf = try allocator.alloc(u8, totlen);
     // istg i keep coming back to zig for some stupid reason and i hate memory mamanget i will switch to nim , i dont know whu i am keep comng back to this
     // secon press : copy each row and append new line
@@ -1025,7 +1025,7 @@ fn editorRowRxToCx(row: *erow, rx: c_int) c_int {
     var cur_rx: c_int = 0; // current rendered column as we walk
     var cx: c_int = 0; // character index we are calcuating
 
-    // walk through each raw charactarter , accimumonating rendered columns
+    // walk through each raw character, accumulating rendered columns
     while (cx < row.size) : (cx += 1) {
         // if this char is a tab  add the padding to reach the next tab stop
         if (row.chars[@intCast(cx)] == '\t') {
